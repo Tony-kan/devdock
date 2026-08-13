@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# devdock console: machine-local service config and captured output
+/services.json
+/.logs/

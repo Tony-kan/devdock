@@ -1,26 +1,83 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
+/*
+ * A local dev tool with a deliberately single look: light neutral shell, dark log
+ * pane, one accent colour. No dark-mode variant — the two surfaces are already
+ * fixed by the design, so honouring the OS theme would only muddy them.
+ */
+@theme {
+  --color-shell: #f1f5f9;
+  --color-panel: #ffffff;
+  --color-panel-soft: #f8fafc;
+  --color-line: #e2e8f0;
+  --color-line-strong: #cbd5e1;
+
+  --color-ink: #0f172a;
+  --color-ink-soft: #475569;
+  --color-ink-faint: #94a3b8;
+
+  --color-accent: #4f46e5;
+  --color-accent-hover: #4338ca;
+  --color-accent-soft: #eef2ff;
+
+  --color-top: #0f172a;
+  --color-top-soft: #1e293b;
+  --color-top-ink: #e2e8f0;
+
+  --color-log-bg: #0b1120;
+  --color-log-ink: #cbd5e1;
+  --color-log-line: #1e293b;
+
+  --color-ok: #10b981;
+  --color-bad: #ef4444;
+  --color-warn: #f59e0b;
+  --color-idle: #94a3b8;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-shell);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+}
+
+/* Running services pulse; everything else holds still. */
+@keyframes devdock-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 rgb(16 185 129 / 0.55);
+  }
+  50% {
+    opacity: 0.75;
+    box-shadow: 0 0 0 4px rgb(16 185 129 / 0);
+  }
+}
+
+.dot-pulse {
+  animation: devdock-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot-pulse {
+    animation: none;
+  }
+}
+
+/* Slim scrollbars, dark inside the log pane. */
+.scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+
+.scroll-slim-dark {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
 }
