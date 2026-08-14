@@ -101,7 +101,7 @@ export function Button({
   return (
     <button
       type="button"
-      className={`inline-flex items-center gap-1.5 rounded-[10px] px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${TONE[tone]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-[10px] px-3 py-1.5 text-sm font-medium whitespace-nowrap transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${TONE[tone]} ${className}`}
       {...rest}
     >
       {children}

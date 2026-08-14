@@ -4,8 +4,18 @@ import { useState } from "react";
 import { Button, HealthDot, KindChip, StatusDot, formatUptime, inputClass } from "@/components/ui";
 import { ALL_SERVICES, type ServiceConfig, type ServiceKind, type Snapshot } from "@/lib/types";
 
+/** One row as displayed: the service plus whether it can move inside its status group. */
+export interface ServiceRow {
+  service: ServiceConfig;
+  rank: number;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+}
+
 interface Props {
   snapshot: Snapshot;
+  /** Pre-ordered by the parent: running first, then crashed, then stopped. */
+  rows: ServiceRow[];
   selected: string;
   onSelect: (id: string) => void;
   onAdd: (draft: { name: string; command: string; port: string; cwd: string; kind: ServiceKind }) => Promise<void>;
@@ -103,16 +113,16 @@ function Row({
   selected,
   onSelect,
   onReorder,
-  isFirst,
-  isLast,
+  canMoveUp,
+  canMoveDown,
 }: {
   service: ServiceConfig;
   snapshot: Snapshot;
   selected: boolean;
   onSelect: () => void;
   onReorder: (direction: -1 | 1) => void;
-  isFirst: boolean;
-  isLast: boolean;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
 }) {
   const runtime = snapshot.runtime[service.id];
   const status = runtime?.status ?? "stopped";
@@ -162,7 +172,7 @@ function Row({
         <button
           type="button"
           onClick={() => onReorder(-1)}
-          disabled={isFirst}
+          disabled={!canMoveUp}
           aria-label={`Move ${service.name} up`}
           className="rounded px-1 text-[10px] leading-tight text-ink-faint hover:bg-slate-200 hover:text-ink disabled:opacity-30"
         >
@@ -171,7 +181,7 @@ function Row({
         <button
           type="button"
           onClick={() => onReorder(1)}
-          disabled={isLast}
+          disabled={!canMoveDown}
           aria-label={`Move ${service.name} down`}
           className="rounded px-1 text-[10px] leading-tight text-ink-faint hover:bg-slate-200 hover:text-ink disabled:opacity-30"
         >
@@ -182,15 +192,21 @@ function Row({
   );
 }
 
-export function ServiceList({ snapshot, selected, onSelect, onAdd, onReorder, onRescan, busy }: Props) {
+export function ServiceList({ snapshot, rows, selected, onSelect, onAdd, onReorder, onRescan, busy }: Props) {
   const [adding, setAdding] = useState(false);
-  const { services } = snapshot;
+  const runningCount = snapshot.counts.running;
 
   return (
     <aside className="flex w-66 shrink-0 flex-col border-r border-line bg-panel xl:w-80">
       <div className="flex items-center gap-2 border-b border-line px-3 py-2">
         <span className="text-xs font-semibold tracking-wide text-ink-soft uppercase">Services</span>
-        <span className="font-mono text-[11px] text-ink-faint">{services.length}</span>
+        {/* The running count lives in the stat strip; repeating it here crowds the row. */}
+        <span
+          className="font-mono text-[11px] text-ink-faint"
+          title={runningCount > 0 ? `${runningCount} running, listed first` : undefined}
+        >
+          {rows.length}
+        </span>
         <div className="ml-auto flex items-center gap-1">
           <Button tone="ghost" onClick={onRescan} disabled={busy !== null} className="px-2 py-1 text-xs">
             Re-scan
@@ -228,20 +244,20 @@ export function ServiceList({ snapshot, selected, onSelect, onAdd, onReorder, on
             </button>
           </li>
 
-          {services.map((service, index) => (
+          {rows.map((row) => (
             <Row
-              key={service.id}
-              service={service}
+              key={row.service.id}
+              service={row.service}
               snapshot={snapshot}
-              selected={selected === service.id}
-              onSelect={() => onSelect(service.id)}
-              onReorder={(direction) => onReorder(service.id, direction)}
-              isFirst={index === 0}
-              isLast={index === services.length - 1}
+              selected={selected === row.service.id}
+              onSelect={() => onSelect(row.service.id)}
+              onReorder={(direction) => onReorder(row.service.id, direction)}
+              canMoveUp={row.canMoveUp}
+              canMoveDown={row.canMoveDown}
             />
           ))}
 
-          {services.length === 0 ? (
+          {rows.length === 0 ? (
             <li className="px-3 py-6 text-sm text-ink-faint">
               Nothing configured yet. Use <span className="font-medium text-ink-soft">Add</span> or{" "}
               <span className="font-medium text-ink-soft">Re-scan</span>.

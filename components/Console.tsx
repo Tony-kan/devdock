@@ -13,10 +13,14 @@ import {
   type LogLevel,
   type ServiceConfig,
   type ServiceKind,
+  type ServiceStatus,
   type Snapshot,
 } from "@/lib/types";
 
 const CLIENT_LOG_LIMIT = 4000;
+
+/** Sort weight per status: running on top, crashed next, stopped last. */
+const STATUS_RANK: Record<ServiceStatus, number> = { running: 0, starting: 0, crashed: 1, stopped: 2 };
 
 interface StreamPayload {
   snapshot?: Snapshot;
@@ -48,6 +52,29 @@ export function Console({ initial }: { initial: Snapshot }) {
   // A service removed elsewhere would leave `selected` pointing at nothing, so the
   // active row is derived rather than corrected in an effect.
   const activeId = service ? service.id : ALL_SERVICES;
+
+  /**
+   * Display order: whatever is up sits at the top, then anything that crashed (it wants
+   * attention next), then the rest. The configured order from services.json breaks ties.
+   *
+   * Ranking never looks at uptime, only at status, so the list holds still while you
+   * read it and only moves when a service actually starts or stops.
+   */
+  const rows = useMemo(() => {
+    const ranked = snapshot.services.map((entry, index) => ({
+      service: entry,
+      index,
+      rank: STATUS_RANK[snapshot.runtime[entry.id]?.status ?? "stopped"],
+    }));
+    ranked.sort((a, b) => a.rank - b.rank || a.index - b.index);
+    return ranked.map((entry, position) => ({
+      service: entry.service,
+      rank: entry.rank,
+      // Reordering is only meaningful within a group; the sort would undo a cross-group move.
+      canMoveUp: position > 0 && ranked[position - 1].rank === entry.rank,
+      canMoveDown: position < ranked.length - 1 && ranked[position + 1].rank === entry.rank,
+    }));
+  }, [snapshot.runtime, snapshot.services]);
 
   // ------------------------------------------------------------------ streaming
 
@@ -223,11 +250,20 @@ export function Console({ initial }: { initial: Snapshot }) {
 
   const reorder = useCallback(
     (id: string, direction: -1 | 1) => {
-      const ids = snapshot.services.map((s) => s.id);
-      const from = ids.indexOf(id);
+      // Arrows act on what is on screen, which is grouped by status. Swapping with the
+      // visible neighbour only makes sense inside a group, so `rows` gates the buttons
+      // at each group edge and this recomputes the same neighbour to swap against.
+      const from = rows.findIndex((row) => row.service.id === id);
       const to = from + direction;
-      if (from < 0 || to < 0 || to >= ids.length) return;
-      [ids[from], ids[to]] = [ids[to], ids[from]];
+      if (from < 0 || to < 0 || to >= rows.length) return;
+      if (rows[from].rank !== rows[to].rank) return;
+
+      const ids = snapshot.services.map((s) => s.id);
+      const a = ids.indexOf(rows[from].service.id);
+      const b = ids.indexOf(rows[to].service.id);
+      if (a < 0 || b < 0) return;
+      [ids[a], ids[b]] = [ids[b], ids[a]];
+
       void fetch("/api/services", {
         method: "PUT",
         headers: { "content-type": "application/json" },
@@ -244,7 +280,7 @@ export function Console({ initial }: { initial: Snapshot }) {
           });
         });
     },
-    [snapshot.services],
+    [rows, snapshot.services],
   );
 
   // ------------------------------------------------------------------ filtering
@@ -294,7 +330,8 @@ export function Console({ initial }: { initial: Snapshot }) {
       }
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
 
-      const ids = [ALL_SERVICES, ...snapshot.services.map((s) => s.id)];
+      // j/k walk the list as displayed, not as configured.
+      const ids = [ALL_SERVICES, ...rows.map((row) => row.service.id)];
       const index = ids.indexOf(activeId);
 
       switch (event.key) {
@@ -347,7 +384,7 @@ export function Console({ initial }: { initial: Snapshot }) {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [activeId, openService, serviceAction, snapshot.services]);
+  }, [activeId, openService, rows, serviceAction]);
 
   // Informational notices fade; errors and warnings stay until dismissed.
   useEffect(() => {
@@ -373,6 +410,7 @@ export function Console({ initial }: { initial: Snapshot }) {
       <div className="flex min-h-0 flex-1">
         <ServiceList
           snapshot={snapshot}
+          rows={rows}
           selected={activeId}
           onSelect={(id) => {
             setSelected(id);

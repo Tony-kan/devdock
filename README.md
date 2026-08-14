@@ -86,6 +86,12 @@ service name in the header is a link to the same address as **Open**.
 **Health** — polls each service's `healthPath` and shows a pass/fail dot. A process
 exiting non-zero is marked crashed.
 
+**Ordering** — the list groups by status: running (and starting) at the top, then
+anything that crashed, then everything stopped. Within a group the order from
+`services.json` is kept, so the list only moves when a service actually starts or
+stops — never on every uptime tick. The ▲▼ arrows reorder inside a group and are
+disabled at its edges, since a cross-group move would be undone by the grouping.
+
 **Editing** — add a service inline (name, command, port); edit command, working
 directory, port, health path, env vars, dependencies, autoStart and the Open URL;
 reorder and remove services. Nothing requires restarting the console.
