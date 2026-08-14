@@ -141,7 +141,9 @@ export function Console({ initial }: { initial: Snapshot }) {
 
   const openService = useCallback(() => {
     if (!service) return;
-    const url = service.url ?? (service.port ? `http://127.0.0.1:${service.port}` : null);
+    // `localhost`, not a literal address: a Vite dev server started without --host
+    // listens on IPv6 loopback only, where http://127.0.0.1:<port> would not connect.
+    const url = service.url ?? (service.port ? `http://localhost:${service.port}` : null);
     if (!url) {
       setNotice({ level: "warn", message: `${service.name} has no port or URL configured.` });
       return;

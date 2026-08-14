@@ -110,7 +110,7 @@ export function ServiceEditor({
             />
           </Field>
         </div>
-        <Field label="Open URL" hint="defaults to http://127.0.0.1:<port>">
+        <Field label="Open URL" hint="defaults to http://localhost:<port>">
           <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="(default)" className={inputClass} />
         </Field>
       </div>

@@ -103,14 +103,19 @@ export async function gitPull(dir: string, rel: string, sink: LineSink): Promise
     return { ok: false, conflicts: false, needsInstall: false, message: `${rel}: pull failed (exit ${result.code})` };
   }
 
-  // ORIG_HEAD is set by pull/rebase, so this is the diffstat for what just landed.
-  const diff = await capture("git", ["diff", "--stat", "ORIG_HEAD", "HEAD"], dir, 15_000);
-  const diffBody = diff.code === 0 ? diff.stdout.trim() : "";
-  if (diffBody) {
-    sink("info", `--- ${rel}: changes pulled ---`);
-    for (const line of diffBody.split("\n")) sink("info", line);
-  } else if (combined.includes("Already up to date") || combined.includes("up to date")) {
-    sink("info", `${rel}: already up to date.`);
+  // `--stat` already prints a diffstat when the pull moved HEAD. Only fall back to an
+  // explicit one when it did not, so the pane does not show the same summary twice.
+  const alreadySummarised = /\d+ files? changed/.test(combined);
+  if (!alreadySummarised) {
+    // ORIG_HEAD is set by pull/rebase, so this is the diffstat for what just landed.
+    const diff = await capture("git", ["diff", "--stat", "ORIG_HEAD", "HEAD"], dir, 15_000);
+    const diffBody = diff.code === 0 ? diff.stdout.trim() : "";
+    if (diffBody) {
+      sink("info", `--- ${rel}: changes pulled ---`);
+      for (const line of diffBody.split("\n")) sink("info", line);
+    } else {
+      sink("info", `${rel}: already up to date.`);
+    }
   }
 
   const touchedFiles = await capture("git", ["diff", "--name-only", "ORIG_HEAD", "HEAD"], dir, 15_000);

@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import net from "node:net";
 import { execFile } from "node:child_process";
 
@@ -6,8 +7,7 @@ export interface PortHolder {
   process: string | null;
 }
 
-/** True when something is already accepting connections on 127.0.0.1:port. */
-export function isPortInUse(port: number, timeoutMs = 600): Promise<boolean> {
+function probe(host: string, port: number, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = new net.Socket();
     let settled = false;
@@ -21,8 +21,20 @@ export function isPortInUse(port: number, timeoutMs = 600): Promise<boolean> {
     socket.once("connect", () => done(true));
     socket.once("timeout", () => done(false));
     socket.once("error", () => done(false));
-    socket.connect(port, "127.0.0.1");
+    socket.connect(port, host);
   });
+}
+
+/**
+ * True when something is already listening on the loopback port.
+ *
+ * Both address families are probed: Vite binds `[::1]` only when started without
+ * `--host`, so an IPv4-only check would report a busy port as free and let a second
+ * service start on top of it.
+ */
+export async function isPortInUse(port: number, timeoutMs = 600): Promise<boolean> {
+  const results = await Promise.all([probe("127.0.0.1", port, timeoutMs), probe("::1", port, timeoutMs)]);
+  return results.some(Boolean);
 }
 
 function run(cmd: string, args: string[]): Promise<string> {
@@ -48,6 +60,25 @@ export async function whoHoldsPort(port: number): Promise<PortHolder | null> {
 
   // Something answered the socket probe but neither tool could name it.
   return ss.trim() || lsof.trim() ? { pid: null, process: null } : null;
+}
+
+/**
+ * Process group of a pid, or null if it is gone.
+ *
+ * Services are spawned through a shell, so the process holding the port is usually a
+ * grandchild of the console rather than the pid we recorded. The group id is what
+ * ties it back to the service we started.
+ */
+export function pgidOf(pid: number): number | null {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The comm field can contain spaces and parentheses, so start after the last ')'.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const pgid = Number(fields[2]);
+    return Number.isFinite(pgid) ? pgid : null;
+  } catch {
+    return null;
+  }
 }
 
 export function describeHolder(holder: PortHolder | null): string {

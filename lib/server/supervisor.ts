@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { LOG_DIR, STATE_PATH, resolveIn } from "./paths";
-import { describeHolder, isPortInUse, whoHoldsPort } from "./ports";
+import { describeHolder, isPortInUse, pgidOf, whoHoldsPort } from "./ports";
 import type { LogStore } from "./logs";
 import type { ActionResult, ConsoleConfig, HealthState, ServiceConfig, ServiceRuntime, ServiceStatus } from "../types";
 
@@ -9,7 +9,11 @@ import type { ActionResult, ConsoleConfig, HealthState, ServiceConfig, ServiceRu
 const SETTLE_MS = 1500;
 /** SIGTERM first, SIGKILL after this. */
 const GRACE_MS = 8000;
-const HEALTH_INTERVAL_MS = 5000;
+/**
+ * Health polling interval. Kept deliberately unhurried: every poll is a real request,
+ * and any service that logs requests writes a line into its own pane because of it.
+ */
+const HEALTH_INTERVAL_MS = 10_000;
 const HEALTH_TIMEOUT_MS = 2500;
 /** How long "start all" waits for one dependency before moving on. */
 const DEPENDENCY_TIMEOUT_MS = 90_000;
@@ -254,7 +258,9 @@ export class Supervisor {
       if (inUse) {
         const holder = await whoHoldsPort(service.port);
         const ours = holder?.pid ? this.serviceHoldingPid(holder.pid) : null;
-        const by = ours ? `"${ours}" started here (pid ${holder?.pid})` : describeHolder(holder);
+        const by = ours
+          ? `"${ours}", which this console started (${describeHolder(holder)})`
+          : describeHolder(holder);
         const message = `Port ${service.port} is already in use by ${by}. ${service.name} was not started.`;
         this.log(service.id, "error", message);
         return { ok: false, message };
@@ -350,9 +356,16 @@ export class Supervisor {
     return { ok: true, message: `Starting ${service.name}…` };
   }
 
+  /**
+   * Map a pid found listening on a port back to one of our services. Matching on the
+   * process group catches the common case where the listener is a grandchild of the
+   * shell we spawned (npm -> vite, gradlew -> java).
+   */
   private serviceHoldingPid(pid: number): string | null {
+    const group = pgidOf(pid);
     for (const managed of this.processes.values()) {
       if (managed.pid === pid) return managed.id;
+      if (group !== null && managed.pgid !== null && managed.pgid === group) return managed.id;
     }
     return null;
   }
@@ -472,11 +485,14 @@ export class Supervisor {
       managed.health = "n/a";
       return false;
     }
-    const url = `http://127.0.0.1:${service.port}${service.healthPath.startsWith("/") ? "" : "/"}${service.healthPath}`;
+    // `localhost` rather than a literal address: Node tries both A and AAAA records,
+    // which is what makes this work against IPv6-only listeners such as bare Vite.
+    const url = `http://localhost:${service.port}${service.healthPath.startsWith("/") ? "" : "/"}${service.healthPath}`;
     try {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
-        headers: { accept: "*/*" },
+        // A recognisable agent so request lines the service logs are traceable to us.
+        headers: { accept: "*/*", "user-agent": "devdock-health-check" },
       });
       managed.health = response.ok ? "pass" : "fail";
     } catch {
