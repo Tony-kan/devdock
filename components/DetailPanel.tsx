@@ -85,7 +85,7 @@ function ServiceHeader({
       </div>
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-xs text-ink-faint">
         <span className="text-ink-soft">$ {service.command}</span>
-        <span>{service.cwd}</span>
+        <span>{service.cwd === "." ? "workspace root" : service.cwd}</span>
         {git?.isRepo ? (
           <span>
             {git.branch ?? "detached"}

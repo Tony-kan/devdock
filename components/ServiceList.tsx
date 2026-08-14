@@ -133,7 +133,8 @@ function Row({
             <span className={`truncate text-sm ${selected ? "font-semibold text-ink" : "font-medium text-ink"}`}>
               {service.name}
             </span>
-            <HealthDot health={runtime?.health ?? "unknown"} />
+            {/* Health only means something while the process is up. */}
+            {status === "running" || status === "starting" ? <HealthDot health={runtime?.health ?? "unknown"} /> : null}
           </span>
           <span className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
             <KindChip kind={service.kind} />
@@ -186,7 +187,7 @@ export function ServiceList({ snapshot, selected, onSelect, onAdd, onReorder, on
   const { services } = snapshot;
 
   return (
-    <aside className="flex w-[264px] shrink-0 flex-col border-r border-line bg-panel xl:w-80">
+    <aside className="flex w-66 shrink-0 flex-col border-r border-line bg-panel xl:w-80">
       <div className="flex items-center gap-2 border-b border-line px-3 py-2">
         <span className="text-xs font-semibold tracking-wide text-ink-soft uppercase">Services</span>
         <span className="font-mono text-[11px] text-ink-faint">{services.length}</span>
