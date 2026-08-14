@@ -71,7 +71,17 @@ function ServiceHeader({
         <h1 className="text-base font-semibold text-ink">{service.name}</h1>
         <StatusPill status={runtime?.status ?? "stopped"} exitCode={runtime?.exitCode ?? null} />
         <KindChip kind={service.kind} />
-        {service.port ? <span className="font-mono text-xs text-ink-soft">:{service.port}</span> : null}
+        {service.port || service.url ? (
+          <a
+            href={service.url ?? `http://localhost:${service.port}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`Open ${service.url ?? `http://localhost:${service.port}`} in a new tab`}
+            className="rounded px-0.5 font-mono text-xs text-accent underline decoration-accent/40 decoration-dotted underline-offset-2 transition-colors hover:bg-accent-soft hover:decoration-accent hover:decoration-solid"
+          >
+            {service.port ? `:${service.port}` : service.url}
+          </a>
+        ) : null}
         {runtime?.status === "running" ? (
           <span className="font-mono text-xs text-ink-faint">
             pid {runtime.pid} · up {formatUptime(runtime.uptimeMs)}

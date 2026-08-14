@@ -76,6 +76,13 @@ the browser, and persisted to `.logs/<service>.log`. Per-service and combined vi
 level filter with counts, text search, follow/pause, clear and copy. Colour-coded by
 level and by service.
 
+**Clickable URLs in output** — `http(s)://` addresses and the bare `localhost:3000` /
+`127.0.0.1:8080` forms that dev servers print are turned into links: dotted underline
+at rest, solid underline and a highlight on hover, and they open in a new tab. Only
+those two shapes are ever linked, so a log line cannot inject a `javascript:` or
+`data:` href. Trailing sentence punctuation stays out of the link. The port beside the
+service name in the header is a link to the same address as **Open**.
+
 **Health** — polls each service's `healthPath` and shows a pass/fail dot. A process
 exiting non-zero is marked crashed.
 
