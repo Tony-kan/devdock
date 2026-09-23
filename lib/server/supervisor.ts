@@ -1,7 +1,18 @@
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { LOG_DIR, STATE_PATH, resolveIn } from "./paths";
-import { describeHolder, findFreePort, isPortInUse, looksLikeContainer, pgidOf, whoHoldsPort } from "./ports";
+import {
+  cmdlineOf,
+  cwdOf,
+  describeHolder,
+  findFreePort,
+  isDescendantOf,
+  isPortInUse,
+  looksLikeContainer,
+  pgidOf,
+  startedAtOf,
+  whoHoldsPort,
+} from "./ports";
 import { planPortOverride } from "./portOverride";
 import { childEnvironment } from "./exec";
 import type { LogStore } from "./logs";
@@ -50,6 +61,8 @@ interface Managed {
   /** Set while a stop we asked for is in flight, so the exit is not read as a crash. */
   stopping: boolean;
   settleTimer: NodeJS.Timeout | null;
+  /** True when we attached to a process started outside the console rather than spawning it. */
+  adopted: boolean;
 }
 
 interface PersistedProcess {
@@ -85,6 +98,7 @@ function emptyManaged(id: string, command: string): Managed {
     activePort: null,
     stopping: false,
     settleTimer: null,
+    adopted: false,
   };
 }
 
@@ -320,6 +334,7 @@ export class Supervisor {
         lastHealthAt: null,
         busy: null,
         activePort: null,
+        adopted: false,
       };
     }
     const running = managed.status === "running" || managed.status === "starting";
@@ -336,6 +351,7 @@ export class Supervisor {
       lastHealthAt: managed.lastHealthAt,
       busy: managed.busy,
       activePort: running ? managed.activePort : null,
+      adopted: managed.adopted,
     };
   }
 
@@ -491,6 +507,9 @@ export class Supervisor {
     for (const managed of this.processes.values()) {
       if (managed.pid === pid) return managed.id;
       if (group !== null && managed.pgid !== null && managed.pgid === group) return managed.id;
+      // Gradle's bootRun forks the app JVM into its own process group, so the group
+      // check misses it; the parent chain still leads back to the shell we spawned.
+      if (managed.pid !== null && isDescendantOf(pid, managed.pid)) return managed.id;
     }
     return null;
   }
@@ -528,6 +547,59 @@ export class Supervisor {
       overrideMechanism: plan && suggestedPort ? planPortOverride(service, suggestedPort, cwd)?.mechanism ?? null : null,
       overrideCaveat: plan && suggestedPort ? planPortOverride(service, suggestedPort, cwd)?.caveat ?? null : null,
     };
+  }
+
+  /**
+   * Attach to a service that is already running because someone started it elsewhere —
+   * in a terminal, an IDE, or a console that has since exited.
+   *
+   * Adoption is only claimed on evidence: the process holding the service's port must
+   * also be working in that service's directory, or name it on its command line.
+   * Without that check any stranger on the port would be reported as the service, and
+   * a later Stop would kill it.
+   *
+   * An adopted process can be stopped and restarted from here, but its output went
+   * wherever it was started, so nothing before the adoption appears in the log pane.
+   */
+  async tryAdopt(service: ServiceConfig): Promise<boolean> {
+    const port = service.port;
+    if (!port) return false;
+
+    const managed = this.managed(service);
+    if (this.isAlive(managed)) return false;
+    if (!(await isPortInUse(port))) return false;
+
+    const holder = await whoHoldsPort(port);
+    if (!holder?.pid) return false;
+    if (this.serviceHoldingPid(holder.pid)) return false;
+
+    const config = this.getConfig();
+    const dir = resolveIn(config.root, service.cwd);
+    const cwd = cwdOf(holder.pid);
+    const cmdline = cmdlineOf(holder.pid) ?? "";
+    const belongs = cwd === dir || cwd?.startsWith(`${dir}/`) === true || cmdline.includes(dir);
+    if (!belongs) return false;
+
+    managed.pid = holder.pid;
+    managed.pgid = pgidOf(holder.pid) ?? holder.pid;
+    managed.child = null;
+    managed.adopted = true;
+    managed.status = "running";
+    managed.startedAt = startedAtOf(holder.pid) ?? Date.now();
+    managed.activePort = port;
+    managed.exitCode = null;
+    managed.exitSignal = null;
+    managed.stopping = false;
+    if (managed.starts === 0) managed.starts = 1;
+
+    this.log(
+      service.id,
+      "warn",
+      `Adopted ${service.name}: already running on port ${port} as ${holder.process ?? "a process"} (pid ${holder.pid}), started outside this console.`,
+    );
+    this.log(service.id, "info", "It can be stopped and restarted from here. Output from before now went to wherever it was started.");
+    this.persistState();
+    return true;
   }
 
   /**
@@ -637,6 +709,19 @@ export class Supervisor {
       this.signal(managed, "SIGKILL");
       const killDeadline = Date.now() + 3000;
       while (Date.now() < killDeadline && this.isAlive(managed)) await sleep(100);
+    }
+
+    // A spawned service settles its own status from the child's close event. An adopted
+    // one has no child handle, so it is finalised here rather than waiting for a poll.
+    if (managed.adopted && !this.isAlive(managed)) {
+      managed.status = "stopped";
+      managed.pid = null;
+      managed.pgid = null;
+      managed.activePort = null;
+      managed.startedAt = null;
+      managed.adopted = false;
+      managed.stopping = false;
+      this.log(service.id, "info", `${service.name} stopped.`);
     }
 
     managed.busy = null;
@@ -770,11 +855,34 @@ export class Supervisor {
     const services = this.getConfig().services;
     await Promise.allSettled(
       services.map(async (service) => {
-        const managed = this.processes.get(service.id);
+        let managed = this.processes.get(service.id);
+
+        // Pick up anything already running that we did not start, so a service launched
+        // in a terminal shows as running here instead of as stopped.
+        if (!managed || !this.isAlive(managed)) {
+          if (await this.tryAdopt(service)) managed = this.processes.get(service.id);
+        }
+
         if (!managed) return;
         if (!this.isAlive(managed)) {
           if (managed.status === "running" || managed.status === "starting") {
-            // The close handler normally covers this; this is the backstop.
+            // An adopted process has no child handle, so no close event fires when it
+            // goes; noticing it here is the only way its status ever settles.
+            if (managed.adopted) {
+              managed.status = managed.stopping ? "stopped" : "crashed";
+              this.log(
+                service.id,
+                managed.stopping ? "info" : "warn",
+                managed.stopping ? `${service.name} stopped.` : `${service.name} exited (it was started outside this console).`,
+              );
+              managed.pid = null;
+              managed.pgid = null;
+              managed.activePort = null;
+              managed.startedAt = null;
+              managed.adopted = false;
+              managed.stopping = false;
+              this.persistState();
+            }
             managed.health = "unknown";
           }
           return;

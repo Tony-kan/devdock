@@ -57,6 +57,13 @@ export interface ServiceRuntime {
    * clash was resolved by moving the service, so the UI can show which one is live.
    */
   activePort: number | null;
+  /**
+   * True when this process was started outside the console — in a terminal, say — and
+   * the console attached to it rather than spawning it. Such a service can be stopped
+   * and restarted from here, but its earlier output went to wherever it was started,
+   * so the log pane has nothing from before the adoption.
+   */
+  adopted: boolean;
 }
 
 export interface GitInfo {

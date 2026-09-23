@@ -159,6 +159,11 @@ function Row({
             {status === "running" && runtime ? (
               <span className="font-mono text-[11px] text-ink-faint">{formatUptime(runtime.uptimeMs)}</span>
             ) : null}
+            {runtime?.adopted ? (
+              <span className="text-[11px] text-sky-700" title="Started outside this console and picked up here">
+                adopted
+              </span>
+            ) : null}
             {runtime && runtime.restarts > 0 ? (
               <span className="font-mono text-[11px] text-ink-faint" title="Restart count">
                 ×{runtime.restarts}

@@ -215,7 +215,11 @@ function classify(candidate: Candidate): ServiceConfig[] {
         kind: "Spring",
         cwd: rel,
         // --console=plain keeps Gradle's ANSI progress bar out of the log pane.
-        command: "./gradlew bootRun --console=plain",
+        // --no-daemon matters for control, not speed: with the Gradle daemon, bootRun
+        // forks the application JVM from the daemon, so the app lands in the daemon's
+        // process group and survives a Stop that kills ours. Without the daemon the
+        // app is a child of this gradlew, inside the group we signal.
+        command: "./gradlew bootRun --console=plain --no-daemon",
         port,
         env: { SPRING_PROFILES_ACTIVE: "dev" },
         healthPath: "/actuator/health",

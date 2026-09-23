@@ -70,15 +70,81 @@ export async function whoHoldsPort(port: number): Promise<PortHolder | null> {
  * ties it back to the service we started.
  */
 export function pgidOf(pid: number): number | null {
+  return statField(pid, 2);
+}
+
+/** Parent pid, or null if the process is gone. */
+export function ppidOf(pid: number): number | null {
+  return statField(pid, 1);
+}
+
+function statField(pid: number, index: number): number | null {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     // The comm field can contain spaces and parentheses, so start after the last ')'.
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const pgid = Number(fields[2]);
-    return Number.isFinite(pgid) ? pgid : null;
+    // Fields after that are: state(0) ppid(1) pgrp(2) …
+    const value = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[index]);
+    return Number.isFinite(value) ? value : null;
   } catch {
     return null;
   }
+}
+
+/** Working directory of a process, or null when it is gone or unreadable. */
+export function cwdOf(pid: number): string | null {
+  try {
+    return fs.readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return null;
+  }
+}
+
+/** Full command line of a process, space separated. */
+export function cmdlineOf(pid: number): string | null {
+  try {
+    return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * When a process started, in epoch milliseconds, read from its own kernel record.
+ *
+ * Adopted services did not start with us, so their uptime has to come from the system
+ * rather than from the moment we noticed them — otherwise a service running since this
+ * morning would report an uptime of seconds.
+ */
+export function startedAtOf(pid: number): number | null {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    // Field 19 after the comm block is starttime, in clock ticks since boot.
+    const ticks = Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19]);
+    if (!Number.isFinite(ticks)) return null;
+    const uptimeSeconds = Number(fs.readFileSync("/proc/uptime", "utf8").split(" ")[0]);
+    if (!Number.isFinite(uptimeSeconds)) return null;
+    // USER_HZ is 100 on every Linux this runs on; /proc exposes no cheaper way to read it.
+    const ageSeconds = uptimeSeconds - ticks / 100;
+    return Date.now() - Math.max(0, ageSeconds) * 1000;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether `pid` is a descendant of `ancestor`.
+ *
+ * Process groups are not enough to recognise our own services: `gradlew bootRun` forks
+ * the application JVM into a group of its own, so a port held by a service this console
+ * started looks like a stranger's. The parent chain still leads back to us.
+ */
+export function isDescendantOf(pid: number, ancestor: number, maxDepth = 24): boolean {
+  let current: number | null = pid;
+  for (let depth = 0; depth < maxDepth && current !== null && current > 1; depth += 1) {
+    if (current === ancestor) return true;
+    current = ppidOf(current);
+  }
+  return false;
 }
 
 /**

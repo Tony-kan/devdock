@@ -107,6 +107,14 @@ function ServiceHeader({
             running on :{runtime.activePort}
           </a>
         ) : null}
+        {runtime?.adopted ? (
+          <span
+            className="rounded bg-sky-50 px-1.5 py-0.5 text-xs font-medium text-sky-700 ring-1 ring-sky-200 ring-inset"
+            title="Started outside this console. It can be stopped and restarted here, but output from before it was picked up went to wherever it was started."
+          >
+            adopted
+          </span>
+        ) : null}
         {runtime?.status === "running" ? (
           <span className="font-mono text-xs text-ink-faint">
             pid {runtime.pid} · up {formatUptime(runtime.uptimeMs)}
@@ -317,7 +325,9 @@ export function DetailPanel(props: Props) {
         emptyHint={
           totalEntries === 0
             ? service
-              ? `No output yet for ${service.name}. Press Start, or "s".`
+              ? runtime?.adopted
+                ? `${service.name} was started outside this console, so its output is going to wherever it was launched. Restart it here to capture output.`
+                : `No output yet for ${service.name}. Press Start, or "s".`
               : "No output yet. Start a service to see its output here."
             : "No lines match the current filter."
         }

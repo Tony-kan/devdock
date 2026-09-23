@@ -3,6 +3,7 @@ import { getConfig, getCore, invalidateGit, markPulled, repoForService, repoPath
 import { resolveIn } from "./paths";
 import { run } from "./exec";
 import { gitPull, installCommandFor } from "./git";
+import { planPortOverride } from "./portOverride";
 import { startOrder } from "./config";
 import type { ActionResult, ConflictResolution, ServiceConfig } from "../types";
 
@@ -150,9 +151,19 @@ export async function startService(service: ServiceConfig, request: StartRequest
 
     let target = service;
     if (request.persist) {
-      target = { ...service, port };
+      // Saving the port alone is not enough: the move is carried by an env var (or a
+      // rewritten command), and leaving the old one behind would make the saved config
+      // contradict itself — the next plain start would bind the port it used to use.
+      const plan = planPortOverride(service, port, resolveIn(config.root, service.cwd));
+      target = {
+        ...service,
+        port,
+        env: { ...service.env, ...(plan?.env ?? {}) },
+        command: plan?.command ?? service.command,
+      };
       writeConfig({ ...config, services: config.services.map((s) => (s.id === service.id ? target : s)) });
       core.logs.append(service.id, "warn", `Saved port ${port} to services.json (was ${service.port ?? "unset"}).`);
+      if (plan) core.logs.append(service.id, "info", `Saved the port mechanism too: ${plan.mechanism}`);
       core.logs.append(
         service.id,
         "warn",
