@@ -1,13 +1,34 @@
 import { buildSnapshot, findService, getCore } from "@/lib/server/core";
-import { installDeps, pullService } from "@/lib/server/actions";
-import type { ActionResult } from "@/lib/types";
+import { installDeps, pullService, startService, type StartRequest } from "@/lib/server/actions";
+import type { ActionResult, ConflictResolution } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
 const ACTIONS = new Set(["start", "stop", "restart", "pull", "install"]);
+const RESOLUTIONS = new Set<ConflictResolution>(["stop-holder", "kill-holder", "use-port"]);
+
+/**
+ * Read the optional start body. A plain start sends nothing; a start that resolves a
+ * port clash names the resolution the user picked in the UI.
+ */
+async function readStartRequest(request: Request): Promise<StartRequest> {
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+  const resolve = RESOLUTIONS.has(body.resolve as ConflictResolution) ? (body.resolve as ConflictResolution) : undefined;
+  const port = Number(body.port);
+  return {
+    resolve,
+    port: Number.isFinite(port) && port > 0 ? port : undefined,
+    persist: body.persist === true,
+  };
+}
 
 /** Per-service actions: start, stop, restart, pull, install. */
-export async function POST(_request: Request, ctx: RouteContext<"/api/services/[id]/[action]">) {
+export async function POST(request: Request, ctx: RouteContext<"/api/services/[id]/[action]">) {
   const { id, action } = await ctx.params;
 
   if (!ACTIONS.has(action)) {
@@ -24,7 +45,7 @@ export async function POST(_request: Request, ctx: RouteContext<"/api/services/[
   try {
     switch (action) {
       case "start":
-        result = await core.supervisor.start(service);
+        result = await startService(service, await readStartRequest(request));
         break;
       case "stop":
         result = await core.supervisor.stop(service);

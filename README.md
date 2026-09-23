@@ -62,9 +62,29 @@ all" honours `dependsOn` ordering and waits for each dependency to become usable
 Tracks real PID, status (`stopped` / `starting` / `running` / `crashed`), uptime, exit
 code and restart count.
 
-**Port conflict detection** — before starting, the port is probed on both IPv4 and
-IPv6 loopback. If it is taken, the start is refused and the holding process is named,
-including which of your own services holds it (matched by process group).
+**Port conflict handling** — before starting, the port is probed on both IPv4 and IPv6
+loopback. If it is taken the start is refused, the holder is named, and the panel
+offers the ways out that actually apply:
+
+| The port is held by | What you are offered |
+| --- | --- |
+| A service this console started (matched by process group) | Stop it and start this one |
+| An outside process | Stop that process — named, with its pid, behind a confirmation |
+| A container-published port | Nothing to signal; stop the container, or move this service |
+| Anything | Start on another port, pre-filled with the nearest free one, optionally saved to `services.json` |
+
+Moving a service's port is worked out per ecosystem and always shown before it runs:
+`SERVER_PORT` for Spring, `--port … --strictPort` for Vite, `-p` for Next. Where a root
+script delegates into an npm workspace, the flag is *not* appended — npm will not pass
+it through `-w` — and the console runs Vite in the workspace package instead. If the
+mechanism cannot be determined, it says so rather than pretending the override worked.
+A Docker Compose entry cannot be moved from here at all, because its ports come from
+the compose file.
+
+Nothing is resolved automatically. Reassigning a port, stopping another service, or
+signalling an outside process are all explicit choices, because services in a workspace
+reference each other by port and a silent change breaks them invisibly. Where a port is
+shared by several configured services, the service header warns before you even try.
 
 **Git, per service and workspace-wide** — current branch, ahead/behind and dirty
 count; `git pull --rebase` with the resulting diffstat streamed into the log pane.
@@ -189,7 +209,20 @@ the selected service.
   console is `SIGKILL`ed instead, survivors are recorded in `.logs/runtime-state.json`
   and reaped on the next start — a recorded pid is only killed when `/proc` still
   shows the same command line, so a recycled pid cannot be mistaken for one of ours.
-- Health checks poll every 10 seconds with a `devdock-health-check` user agent.
+- That file is keyed by the pid of the console that owns each set of children, so two
+  instances can coexist: a console starting up leaves the services of a **live** owner
+  alone and only reaps those of an owner that is gone. Its own entry is dropped on a
+  clean exit.
+- "Stop all" cancels a "Start all" that is still walking the list, rather than racing
+  it.
+- Children get a **sanitised environment**: `PORT`, `NODE_ENV`, `HOSTNAME` and Next's
+  internal variables are removed, because they describe the console rather than the
+  service. Left in place, a service that honours `PORT` would try to bind the
+  console's own port, and an inherited `NODE_ENV=production` would put a dev server
+  into production mode and make `npm install` skip devDependencies. A service's own
+  env is applied afterwards, so it can still set any of them deliberately.
+- Health checks poll every 10 seconds with a `devdock-health-check` user agent, against
+  whichever port the service actually bound.
 
 ## Limitations
 
@@ -200,14 +233,13 @@ machine — the start fails and the error appears in the log pane. Fixing that m
 installing the toolchain.
 
 **Declared ports can collide.** Generated ports come from what each project declares.
-Projects that declare nothing fall back to their framework default, so several
-services can end up claiming the same port (Spring services at 8080, Vite apps at
-3000) and only one of each group can run at a time. The console deliberately does
-**not** inject port overrides: services commonly reference each other by port in their
-own configuration, so silently moving one would break integration in a way that is
-invisible from here. To run several at once, set the port variable in a service's env
-under **Edit** (`SERVER_PORT` for Spring, a `--port` flag for Vite) and update the
-URLs in whatever calls it.
+Projects that declare nothing fall back to their framework default, so several services
+can end up claiming the same port (Spring services at 8080, Vite apps at 3000) and only
+one of each group can run at a time. The console warns about this in the service header
+and offers a way out when a start is refused, but it will not renumber your services
+for you: they reference each other by port, so moving one means updating whatever calls
+it. Saving a moved port to `services.json` changes only this console's idea of where
+the service listens.
 
 **Only processes the console started are tracked.** Anything you launched from a
 terminal is invisible to the status list; the port conflict detector is what tells you
@@ -242,6 +274,8 @@ app/
   api/services/route.ts          list, add, reorder, re-scan
   api/services/[id]/route.ts     edit, remove
   api/services/[id]/[action]/    start, stop, restart, pull, install
+                                 (start takes an optional body naming how to resolve
+                                  a port clash: stop-holder / kill-holder / use-port)
   api/bulk/[action]/route.ts     start-all, stop-all, pull-all
 components/                      the single-screen UI
 lib/types.ts                     shared types (no Node imports)
@@ -252,8 +286,10 @@ lib/server/
   config.ts      services.json load/save, dependency ordering
   discover.ts    workspace scan
   git.ts         status, pull --rebase, install commands
-  ports.ts       port probing and holder identification
-  exec.ts        one-shot command runner with line streaming
+  ports.ts       port probing, holder identification, free-port search
+  portOverride.ts  how to start a given service on a different port
+  actions.ts     pull/install, bulk operations, conflict resolution
+  exec.ts        one-shot command runner, child environment sanitising
 ```
 
 `services.json` and `.logs/` are gitignored — they are machine-local.

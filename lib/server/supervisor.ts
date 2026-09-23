@@ -1,9 +1,20 @@
 import fs from "node:fs";
 import { spawn, type ChildProcess } from "node:child_process";
 import { LOG_DIR, STATE_PATH, resolveIn } from "./paths";
-import { describeHolder, isPortInUse, pgidOf, whoHoldsPort } from "./ports";
+import { describeHolder, findFreePort, isPortInUse, looksLikeContainer, pgidOf, whoHoldsPort } from "./ports";
+import { planPortOverride } from "./portOverride";
+import { childEnvironment } from "./exec";
 import type { LogStore } from "./logs";
-import type { ActionResult, ConsoleConfig, HealthState, ServiceConfig, ServiceRuntime, ServiceStatus } from "../types";
+import type {
+  ActionResult,
+  ConsoleConfig,
+  HealthState,
+  PortConflict,
+  PortHolder,
+  ServiceConfig,
+  ServiceRuntime,
+  ServiceStatus,
+} from "../types";
 
 /** A live PID counts as running once it has survived this long. */
 const SETTLE_MS = 1500;
@@ -34,6 +45,8 @@ interface Managed {
   health: HealthState;
   lastHealthAt: number | null;
   busy: string | null;
+  /** The port this run was actually started on — may differ from the configured one. */
+  activePort: number | null;
   /** Set while a stop we asked for is in flight, so the exit is not read as a crash. */
   stopping: boolean;
   settleTimer: NodeJS.Timeout | null;
@@ -46,6 +59,13 @@ interface PersistedProcess {
   command: string;
   startedAt: number;
 }
+
+/**
+ * The crash-recovery file, keyed by the pid of the console that owns each set of
+ * children. Keying by owner is what lets two console instances coexist without one
+ * reaping the other's services.
+ */
+type StateFile = Record<string, { startedAt: number; processes: PersistedProcess[] }>;
 
 function emptyManaged(id: string, command: string): Managed {
   return {
@@ -62,9 +82,24 @@ function emptyManaged(id: string, command: string): Managed {
     health: "unknown",
     lastHealthAt: null,
     busy: null,
+    activePort: null,
     stopping: false,
     settleTimer: null,
   };
+}
+
+export interface StartOptions {
+  /** Start on this port instead of the configured one, for this run only. */
+  portOverride?: number;
+}
+
+/** Phrase a holder for a message, naming one of our own services when we can. */
+function describeConflictHolder(holder: PortHolder): string {
+  if (holder.serviceId) {
+    return `"${holder.serviceName ?? holder.serviceId}", which this console started${holder.pid ? ` (pid ${holder.pid})` : ""}`;
+  }
+  if (holder.likelyContainer) return "a container-published port (no process to signal)";
+  return describeHolder(holder);
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -73,6 +108,13 @@ export class Supervisor {
   private processes = new Map<string, Managed>();
   private healthTimer: NodeJS.Timeout | null = null;
   private shuttingDown = false;
+  private bootedAt = Date.now();
+  /**
+   * Bumped whenever a bulk start should stop. "Start all" walks a long list with an
+   * await per service, so without this a "Stop all" pressed midway would stop what was
+   * up and then watch the loop keep starting the rest.
+   */
+  private bulkToken = 0;
 
   constructor(
     private logs: LogStore,
@@ -87,37 +129,78 @@ export class Supervisor {
     this.healthTimer.unref?.();
   }
 
-  /**
-   * Kill process groups left behind by a previous console that died without
-   * cleaning up. A recorded pid is only killed when /proc still shows the same
-   * command line, so a recycled pid cannot be mistaken for ours.
-   */
-  private reapOrphans(): void {
-    let records: PersistedProcess[] = [];
+  /** Read the crash-recovery file, tolerating both absence and a corrupt file. */
+  private readState(): StateFile {
     try {
-      records = JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) as PersistedProcess[];
+      const parsed = JSON.parse(fs.readFileSync(STATE_PATH, "utf8")) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed as StateFile;
     } catch {
-      return;
+      // No file yet, or unreadable — either way there is nothing to recover.
     }
-    for (const record of records) {
-      let cmdline = "";
-      try {
-        cmdline = fs.readFileSync(`/proc/${record.pid}/cmdline`, "utf8").replace(/\0/g, " ");
-      } catch {
-        continue;
-      }
-      if (!cmdline.includes(record.command)) continue;
-      try {
-        process.kill(-record.pgid, "SIGKILL");
-        this.logs.console("warn", `Reaped orphaned "${record.id}" (pid ${record.pid}) left by a previous console run.`);
-      } catch {
-        // Gone between the check and the kill — nothing to do.
-      }
-    }
-    this.persistState();
+    return {};
   }
 
-  private persistState(): void {
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Kill process groups left behind by a console that died without cleaning up.
+   *
+   * Records are grouped by the pid of the console that owns them, and only the records
+   * of an owner that is **gone** are reaped. Without that check a second console
+   * instance — `npm run dev` alongside `npm start`, or two copies of the app — would
+   * kill the first one's healthy services on startup, which is exactly what happened
+   * before this was keyed by owner.
+   *
+   * A recorded pid is only killed when /proc still shows the same command line, so a
+   * recycled pid cannot be mistaken for ours.
+   */
+  private reapOrphans(): void {
+    const state = this.readState();
+    const kept: StateFile = {};
+
+    for (const [ownerKey, entry] of Object.entries(state)) {
+      const owner = Number(ownerKey);
+      if (owner === process.pid) continue;
+
+      if (this.isProcessAlive(owner)) {
+        // Another console is running and these are its children, not orphans.
+        kept[ownerKey] = entry;
+        this.logs.console(
+          "warn",
+          `Another console (pid ${owner}) is running and owns ${entry.processes.length} service(s); leaving them alone.`,
+        );
+        continue;
+      }
+
+      for (const record of entry.processes) {
+        let cmdline = "";
+        try {
+          cmdline = fs.readFileSync(`/proc/${record.pid}/cmdline`, "utf8").replace(/\0/g, " ");
+        } catch {
+          continue;
+        }
+        if (!cmdline.includes(record.command)) continue;
+        try {
+          process.kill(-record.pgid, "SIGKILL");
+          this.logs.console("warn", `Reaped orphaned "${record.id}" (pid ${record.pid}) left by a previous console run.`);
+        } catch {
+          // Gone between the check and the kill — nothing to do.
+        }
+      }
+    }
+
+    this.persistState(kept);
+  }
+
+  /** Record our own children, preserving the entries of any other live console. */
+  private persistState(preserve?: StateFile): void {
     const records: PersistedProcess[] = [];
     for (const managed of this.processes.values()) {
       if (managed.pid && managed.pgid && managed.startedAt && managed.status !== "stopped" && managed.status !== "crashed") {
@@ -130,9 +213,20 @@ export class Supervisor {
         });
       }
     }
+
+    const state: StateFile = preserve ?? {};
+    if (!preserve) {
+      // Keep whatever other live consoles have recorded; drop dead owners.
+      for (const [ownerKey, entry] of Object.entries(this.readState())) {
+        const owner = Number(ownerKey);
+        if (owner !== process.pid && this.isProcessAlive(owner)) state[ownerKey] = entry;
+      }
+    }
+    state[String(process.pid)] = { startedAt: this.bootedAt, processes: records };
+
     try {
       fs.mkdirSync(LOG_DIR, { recursive: true });
-      fs.writeFileSync(STATE_PATH, `${JSON.stringify(records, null, 2)}\n`, "utf8");
+      fs.writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, "utf8");
     } catch {
       // Losing the crash-recovery record is not worth failing an action over.
     }
@@ -147,6 +241,22 @@ export class Supervisor {
   /** Synchronous last resort, safe to call from a `process.on("exit")` handler. */
   killAllSync(): void {
     for (const managed of this.processes.values()) this.signal(managed, "SIGKILL");
+  }
+
+  /**
+   * Drop our own entry from the crash-recovery file on a clean exit.
+   *
+   * Nothing of ours is orphaned at this point, so leaving records behind would only
+   * widen the window in which a recycled pid could match one of them.
+   */
+  releaseState(): void {
+    const state = this.readState();
+    delete state[String(process.pid)];
+    try {
+      fs.writeFileSync(STATE_PATH, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    } catch {
+      // Exiting anyway.
+    }
   }
 
   // ------------------------------------------------------------------ helpers
@@ -209,6 +319,7 @@ export class Supervisor {
         health: service.healthPath ? "unknown" : "n/a",
         lastHealthAt: null,
         busy: null,
+        activePort: null,
       };
     }
     const running = managed.status === "running" || managed.status === "starting";
@@ -224,6 +335,7 @@ export class Supervisor {
       health: service.healthPath ? managed.health : "n/a",
       lastHealthAt: managed.lastHealthAt,
       busy: managed.busy,
+      activePort: running ? managed.activePort : null,
     };
   }
 
@@ -235,7 +347,7 @@ export class Supervisor {
 
   // -------------------------------------------------------------------- start
 
-  async start(service: ServiceConfig): Promise<ActionResult> {
+  async start(service: ServiceConfig, options: StartOptions = {}): Promise<ActionResult> {
     const managed = this.managed(service);
     managed.command = service.command;
 
@@ -253,20 +365,8 @@ export class Supervisor {
       return { ok: false, message };
     }
 
-    if (service.port) {
-      const inUse = await isPortInUse(service.port);
-      if (inUse) {
-        const holder = await whoHoldsPort(service.port);
-        const ours = holder?.pid ? this.serviceHoldingPid(holder.pid) : null;
-        const by = ours
-          ? `"${ours}", which this console started (${describeHolder(holder)})`
-          : describeHolder(holder);
-        const message = `Port ${service.port} is already in use by ${by}. ${service.name} was not started.`;
-        this.log(service.id, "error", message);
-        return { ok: false, message };
-      }
-    }
-
+    const port = options.portOverride ?? service.port ?? null;
+    let command = service.command;
     const env: Record<string, string> = {
       // Keep ANSI colour sequences out of the log pane.
       NO_COLOR: "1",
@@ -274,14 +374,37 @@ export class Supervisor {
       ...service.env,
     };
 
-    this.log(service.id, "info", `$ ${service.command}`);
-    this.log(service.id, "info", `  (cwd ${cwd}${service.port ? `, port ${service.port}` : ""})`);
+    if (options.portOverride) {
+      const plan = planPortOverride(service, options.portOverride, cwd);
+      if (!plan) {
+        const message = `${service.name} cannot be started on a different port from here — its port comes from its compose file.`;
+        this.log(service.id, "error", message);
+        return { ok: false, message };
+      }
+      command = plan.command;
+      Object.assign(env, plan.env);
+      this.log(service.id, "warn", `Port override for this run: ${plan.mechanism} (configured port is ${service.port ?? "unset"}).`);
+      if (plan.caveat) this.log(service.id, "warn", plan.caveat);
+    }
+
+    if (port) {
+      if (await isPortInUse(port)) {
+        const conflict = await this.describeConflict(service, port);
+        const message = `Port ${port} is already in use by ${describeConflictHolder(conflict.holder)}. ${service.name} was not started.`;
+        this.log(service.id, "error", message);
+        this.logResolutionHints(service, conflict);
+        return { ok: false, message, conflict };
+      }
+    }
+
+    this.log(service.id, "info", `$ ${command}`);
+    this.log(service.id, "info", `  (cwd ${cwd}${port ? `, port ${port}` : ""})`);
 
     let child: ChildProcess;
     try {
-      child = spawn(service.command, {
+      child = spawn(command, {
         cwd,
-        env: { ...process.env, ...env },
+        env: childEnvironment(env),
         shell: true,
         // Its own process group, so stopping kills the whole tree rather than just the shell.
         detached: true,
@@ -297,6 +420,7 @@ export class Supervisor {
     managed.child = child;
     managed.pid = child.pid ?? null;
     managed.pgid = child.pid ?? null;
+    managed.activePort = port;
     managed.status = "starting";
     managed.startedAt = Date.now();
     managed.exitCode = null;
@@ -328,6 +452,7 @@ export class Supervisor {
       managed.stopping = false;
       managed.health = "unknown";
       managed.startedAt = null;
+      managed.activePort = null;
 
       if (requested) {
         managed.status = "stopped";
@@ -368,6 +493,124 @@ export class Supervisor {
       if (group !== null && managed.pgid !== null && managed.pgid === group) return managed.id;
     }
     return null;
+  }
+
+  /**
+   * Gather everything needed to offer a way out of a clash: who holds the port, whether
+   * it is one of ours, whether it is container-published, and a free port to move to.
+   */
+  async describeConflict(service: ServiceConfig, port: number): Promise<PortConflict> {
+    const config = this.getConfig();
+    const raw = await whoHoldsPort(port);
+    const ourId = raw?.pid ? this.serviceHoldingPid(raw.pid) : null;
+    const ourService = ourId ? config.services.find((s) => s.id === ourId) ?? null : null;
+
+    // Never suggest a port another service already claims.
+    const claimed = new Set<number>();
+    for (const other of config.services) if (other.port) claimed.add(other.port);
+    for (const managed of this.processes.values()) if (managed.activePort) claimed.add(managed.activePort);
+
+    const cwd = resolveIn(config.root, service.cwd);
+    const plan = planPortOverride(service, port, cwd);
+    const suggestedPort = plan ? await findFreePort(port + 1, claimed) : null;
+
+    return {
+      serviceId: service.id,
+      port,
+      holder: {
+        pid: raw?.pid ?? null,
+        process: raw?.process ?? null,
+        serviceId: ourId,
+        serviceName: ourService?.name ?? null,
+        likelyContainer: ourId === null && looksLikeContainer(raw),
+      },
+      suggestedPort,
+      overrideMechanism: plan && suggestedPort ? planPortOverride(service, suggestedPort, cwd)?.mechanism ?? null : null,
+      overrideCaveat: plan && suggestedPort ? planPortOverride(service, suggestedPort, cwd)?.caveat ?? null : null,
+    };
+  }
+
+  /**
+   * Wait for a port to be released after freeing whatever held it.
+   *
+   * A process exiting does not guarantee its listening socket is immediately
+   * reusable, and starting into that gap produces an "address already in use" crash
+   * that looks like the resolution simply did not work.
+   */
+  async waitForPortFree(port: number, serviceId: string, timeoutMs = 8000): Promise<boolean> {
+    if (!(await isPortInUse(port))) return true;
+    this.log(serviceId, "info", `Waiting for port ${port} to be released…`);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(300);
+      if (!(await isPortInUse(port))) return true;
+    }
+    this.log(serviceId, "error", `Port ${port} is still in use after ${timeoutMs / 1000}s.`);
+    return false;
+  }
+
+  /** Spell the options out in the log pane too, so the terminal is never the only record. */
+  private logResolutionHints(service: ServiceConfig, conflict: PortConflict): void {
+    const { holder, suggestedPort } = conflict;
+    if (holder.serviceId) {
+      this.log(service.id, "warn", `That is "${holder.serviceName ?? holder.serviceId}", started from this console — stop it to free port ${conflict.port}.`);
+    } else if (holder.likelyContainer) {
+      this.log(service.id, "warn", `Port ${conflict.port} looks container-published; no process can be signalled. Stop the container (\`docker ps\`) or start on another port.`);
+    } else if (holder.pid) {
+      this.log(service.id, "warn", `Port ${conflict.port} is held by an outside process (${describeHolder(holder)}) — this console did not start it.`);
+    }
+    if (suggestedPort && conflict.overrideMechanism) {
+      this.log(service.id, "info", `Port ${suggestedPort} is free — starting there would apply ${conflict.overrideMechanism}.`);
+    }
+  }
+
+  /**
+   * Terminate a process this console did not start, to free a port on explicit request.
+   * Refuses anything that would take the console down with it.
+   */
+  async killForeignProcess(pid: number, serviceId: string): Promise<{ ok: boolean; message: string }> {
+    if (pid <= 1 || pid === process.pid || pid === process.ppid) {
+      const message = `Refusing to signal pid ${pid} — that is not a safe target.`;
+      this.log(serviceId, "error", message);
+      return { ok: false, message };
+    }
+    if (this.serviceHoldingPid(pid)) {
+      const message = `pid ${pid} belongs to a service this console manages — stop that service instead.`;
+      this.log(serviceId, "error", message);
+      return { ok: false, message };
+    }
+
+    const group = pgidOf(pid);
+    this.log(serviceId, "warn", `$ kill -TERM ${group ? `-${group}` : pid}   (freeing the port; this process was not started here)`);
+    try {
+      if (group) process.kill(-group, "SIGTERM");
+      else process.kill(pid, "SIGTERM");
+    } catch (error) {
+      const message = `Could not signal pid ${pid}: ${error instanceof Error ? error.message : String(error)}`;
+      this.log(serviceId, "error", message);
+      return { ok: false, message };
+    }
+
+    const deadline = Date.now() + 6000;
+    while (Date.now() < deadline) {
+      await sleep(200);
+      try {
+        process.kill(pid, 0);
+      } catch {
+        this.log(serviceId, "info", `pid ${pid} exited.`);
+        return { ok: true, message: `Stopped pid ${pid}.` };
+      }
+    }
+
+    this.log(serviceId, "warn", `pid ${pid} ignored SIGTERM — sending SIGKILL.`);
+    try {
+      if (group) process.kill(-group, "SIGKILL");
+      else process.kill(pid, "SIGKILL");
+    } catch {
+      // Gone between the check and the kill.
+    }
+    await sleep(500);
+    return { ok: true, message: `Stopped pid ${pid}.` };
   }
 
   // --------------------------------------------------------------------- stop
@@ -411,14 +654,27 @@ export class Supervisor {
 
   // ---------------------------------------------------------- bulk operations
 
-  /** Start every service in dependency order, waiting for each dependency to come up. */
+  /**
+   * Start every service in dependency order, waiting for each dependency to come up.
+   *
+   * The loop is cancellable: "Stop all" bumps the token, so a bulk start already in
+   * flight stops issuing new starts instead of racing the shutdown it was asked to
+   * yield to.
+   */
   async startAll(ordered: ServiceConfig[]): Promise<ActionResult> {
+    const token = ++this.bulkToken;
     const dependencies = new Set<string>();
     for (const service of ordered) for (const dep of service.dependsOn ?? []) dependencies.add(dep);
 
     let started = 0;
     let skipped = 0;
+    let cancelled = false;
+
     for (const service of ordered) {
+      if (token !== this.bulkToken || this.shuttingDown) {
+        cancelled = true;
+        break;
+      }
       const managed = this.managed(service);
       if (this.isAlive(managed)) {
         skipped += 1;
@@ -433,8 +689,10 @@ export class Supervisor {
       if (dependencies.has(service.id)) await this.waitUntilUsable(service);
     }
 
-    const message = `Start all: ${started} started, ${skipped} skipped.`;
-    this.logs.console(started > 0 ? "info" : "warn", message);
+    const message = cancelled
+      ? `Start all cancelled: ${started} started before it was stopped.`
+      : `Start all: ${started} started, ${skipped} skipped.`;
+    this.logs.console(cancelled || started === 0 ? "warn" : "info", message);
     return { ok: started > 0, message };
   }
 
@@ -465,6 +723,9 @@ export class Supervisor {
   }
 
   async stopAll(ordered: ServiceConfig[]): Promise<ActionResult> {
+    // Cancel any bulk start still walking the list, or it would keep starting
+    // services behind us.
+    this.bulkToken += 1;
     // Reverse dependency order: dependants go down before what they depend on.
     const reversed = [...ordered].reverse();
     let stopped = 0;
@@ -481,13 +742,15 @@ export class Supervisor {
   // ------------------------------------------------------------------- health
 
   private async checkHealth(service: ServiceConfig, managed: Managed): Promise<boolean> {
-    if (!service.port || !service.healthPath) {
+    // Follow the port this run actually bound, which a resolved clash may have moved.
+    const port = managed.activePort ?? service.port;
+    if (!port || !service.healthPath) {
       managed.health = "n/a";
       return false;
     }
     // `localhost` rather than a literal address: Node tries both A and AAAA records,
     // which is what makes this work against IPv6-only listeners such as bare Vite.
-    const url = `http://localhost:${service.port}${service.healthPath.startsWith("/") ? "" : "/"}${service.healthPath}`;
+    const url = `http://localhost:${port}${service.healthPath.startsWith("/") ? "" : "/"}${service.healthPath}`;
     try {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
@@ -516,7 +779,7 @@ export class Supervisor {
           }
           return;
         }
-        if (!service.port || !service.healthPath) {
+        if (!(managed.activePort ?? service.port) || !service.healthPath) {
           managed.health = "n/a";
           return;
         }

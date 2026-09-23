@@ -81,6 +81,29 @@ export function pgidOf(pid: number): number | null {
   }
 }
 
+/**
+ * First free loopback port at or above `from`, skipping anything already claimed by
+ * another configured service so we never hand out a port someone else expects.
+ */
+export async function findFreePort(from: number, avoid: Set<number> = new Set(), attempts = 200): Promise<number | null> {
+  for (let port = from; port < Math.min(from + attempts, 65_535); port += 1) {
+    if (avoid.has(port)) continue;
+    if (!(await isPortInUse(port, 250))) return port;
+  }
+  return null;
+}
+
+/**
+ * Docker publishes ports from a network namespace this process cannot inspect without
+ * elevation, so the socket answers but no owning process is visible. Signalling is
+ * impossible in that case; the container has to be stopped instead.
+ */
+export function looksLikeContainer(holder: PortHolder | null): boolean {
+  if (!holder) return false;
+  if (holder.pid === null) return true;
+  return /docker|containerd|podman/i.test(holder.process ?? "");
+}
+
 export function describeHolder(holder: PortHolder | null): string {
   if (!holder) return "an unidentified process";
   if (holder.pid && holder.process) return `${holder.process} (pid ${holder.pid})`;

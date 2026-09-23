@@ -55,6 +55,7 @@ function boot(): Core {
   process.once("SIGHUP", () => shutdown("SIGHUP"));
   process.on("exit", () => {
     core.supervisor.killAllSync();
+    core.supervisor.releaseState();
     logs.closeAll();
   });
 
@@ -137,6 +138,22 @@ export async function buildSnapshot(options: { forceGit?: boolean } = {}): Promi
   const git = await gitStatusFor(config, repos, options.forceGit);
 
   const runtime = Object.fromEntries(config.services.map((s) => [s.id, core.supervisor.runtimeFor(s)]));
+
+  // Which services claim the same port as each other, so the UI can warn up front
+  // rather than only when a start is refused.
+  const byPort = new Map<number, string[]>();
+  for (const service of config.services) {
+    if (!service.port) continue;
+    const ids = byPort.get(service.port);
+    if (ids) ids.push(service.id);
+    else byPort.set(service.port, [service.id]);
+  }
+  const sharedPorts: Record<string, string[]> = {};
+  for (const ids of byPort.values()) {
+    if (ids.length < 2) continue;
+    for (const id of ids) sharedPorts[id] = ids.filter((other) => other !== id);
+  }
+
   const running = Object.values(runtime).filter((r) => r.status === "running" || r.status === "starting").length;
   const errors = Object.values(runtime).filter((r) => r.status === "crashed" || r.health === "fail").length;
   const repoInfos = Object.values(git).filter((info) => info.isRepo);
@@ -157,5 +174,6 @@ export async function buildSnapshot(options: { forceGit?: boolean } = {}): Promi
     lastPullAt: core.lastPullAt,
     configPath: CONFIG_PATH,
     logDir: LOG_DIR,
+    sharedPorts,
   };
 }

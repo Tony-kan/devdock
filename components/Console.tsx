@@ -12,6 +12,8 @@ import {
   type LogEntry,
   type LogLevel,
   type ServiceConfig,
+  type ConflictResolution,
+  type PortConflict,
   type ServiceKind,
   type ServiceStatus,
   type Snapshot,
@@ -42,6 +44,7 @@ export function Console({ initial }: { initial: Snapshot }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice>(null);
   const [editing, setEditing] = useState(false);
+  const [conflict, setConflict] = useState<PortConflict | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
 
   const service = useMemo(
@@ -122,8 +125,10 @@ export function Console({ initial }: { initial: Snapshot }) {
 
   const applyResult = useCallback((result: ActionResult & { snapshot?: Snapshot }) => {
     if (result.snapshot) setSnapshot(result.snapshot);
+    // A port clash gets its own panel with the ways out, not just a red line of text.
+    setConflict(result.conflict ?? null);
     if (!result.ok) {
-      setNotice({ level: "error", message: result.message });
+      if (!result.conflict) setNotice({ level: "error", message: result.message });
       return;
     }
     if (result.conflicts) {
@@ -162,6 +167,18 @@ export function Console({ initial }: { initial: Snapshot }) {
     (action: "start" | "stop" | "restart" | "pull" | "install") => {
       if (!service) return;
       void post(`${service.id}:${action}`, `/api/services/${encodeURIComponent(service.id)}/${action}`);
+    },
+    [post, service],
+  );
+
+  /** Retry the start with the resolution the user picked in the conflict panel. */
+  const resolveConflict = useCallback(
+    (resolution: ConflictResolution, options: { port?: number; persist?: boolean }) => {
+      if (!service) return;
+      void post(`${service.id}:start`, `/api/services/${encodeURIComponent(service.id)}/start`, {
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ resolve: resolution, ...options }),
+      });
     },
     [post, service],
   );
@@ -452,6 +469,9 @@ export function Console({ initial }: { initial: Snapshot }) {
           notice={notice}
           onDismissNotice={() => setNotice(null)}
           searchRef={searchRef}
+          conflict={conflict}
+          onResolveConflict={resolveConflict}
+          onDismissConflict={() => setConflict(null)}
         />
       </div>
     </div>

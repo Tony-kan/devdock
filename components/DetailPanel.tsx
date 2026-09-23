@@ -3,7 +3,17 @@
 import { Button, KindChip, StatusPill, formatUptime } from "@/components/ui";
 import { LogPane } from "@/components/LogPane";
 import { ServiceEditor } from "@/components/ServiceEditor";
-import { ALL_SERVICES, type GitInfo, type LogEntry, type LogLevel, type ServiceConfig, type Snapshot } from "@/lib/types";
+import { ConflictPanel } from "@/components/ConflictPanel";
+import {
+  ALL_SERVICES,
+  type ConflictResolution,
+  type GitInfo,
+  type LogEntry,
+  type LogLevel,
+  type PortConflict,
+  type ServiceConfig,
+  type Snapshot,
+} from "@/lib/types";
 
 export type LevelFilter = "all" | LogLevel;
 
@@ -41,6 +51,9 @@ interface Props {
   notice: { level: LogLevel; message: string } | null;
   onDismissNotice: () => void;
   searchRef: React.RefObject<HTMLInputElement | null>;
+  conflict: PortConflict | null;
+  onResolveConflict: (resolution: ConflictResolution, options: { port?: number; persist?: boolean }) => void;
+  onDismissConflict: () => void;
 }
 
 function CombinedHeader({ snapshot }: { snapshot: Snapshot }) {
@@ -65,6 +78,7 @@ function ServiceHeader({
   git: GitInfo | null;
 }) {
   const runtime = snapshot.runtime[service.id];
+  const shared = snapshot.sharedPorts[service.id] ?? [];
   return (
     <div className="flex min-w-0 flex-col gap-1.5">
       <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
@@ -80,6 +94,17 @@ function ServiceHeader({
             className="rounded px-0.5 font-mono text-xs text-accent underline decoration-accent/40 decoration-dotted underline-offset-2 transition-colors hover:bg-accent-soft hover:decoration-accent hover:decoration-solid"
           >
             {service.port ? `:${service.port}` : service.url}
+          </a>
+        ) : null}
+        {runtime?.activePort && runtime.activePort !== service.port ? (
+          <a
+            href={`http://localhost:${runtime.activePort}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={`Running on port ${runtime.activePort} instead of the configured ${service.port ?? "none"}`}
+            className="rounded bg-warn/15 px-1 font-mono text-xs text-amber-700 ring-1 ring-warn/30 ring-inset hover:bg-warn/25"
+          >
+            running on :{runtime.activePort}
           </a>
         ) : null}
         {runtime?.status === "running" ? (
@@ -106,6 +131,14 @@ function ServiceHeader({
         ) : (
           <span>not a git repository</span>
         )}
+        {shared.length > 0 ? (
+          <span
+            className="text-amber-700"
+            title={`Also configured on port ${service.port}: ${shared.join(", ")}. Only one of them can run at a time.`}
+          >
+            port {service.port} shared with {shared.length} other{shared.length === 1 ? "" : "s"}
+          </span>
+        ) : null}
       </div>
     </div>
   );
@@ -137,6 +170,9 @@ export function DetailPanel(props: Props) {
     notice,
     onDismissNotice,
     searchRef,
+    conflict,
+    onResolveConflict,
+    onDismissConflict,
   } = props;
 
   const runtime = service ? snapshot.runtime[service.id] : null;
@@ -174,6 +210,20 @@ export function DetailPanel(props: Props) {
           </div>
         ) : null}
       </div>
+
+      {conflict && service && conflict.serviceId === service.id ? (
+        <ConflictPanel
+          conflict={conflict}
+          serviceName={service.name}
+          busy={disabled}
+          onResolve={onResolveConflict}
+          onDismiss={onDismissConflict}
+          onEdit={() => {
+            onDismissConflict();
+            onEditing(true);
+          }}
+        />
+      ) : null}
 
       {notice ? (
         <div

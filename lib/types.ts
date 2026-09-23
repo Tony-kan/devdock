@@ -52,6 +52,11 @@ export interface ServiceRuntime {
   lastHealthAt: number | null;
   /** Set while a blocking action runs, e.g. "pulling", "installing", "stopping". */
   busy: string | null;
+  /**
+   * The port this run was actually started on. Differs from the configured port when a
+   * clash was resolved by moving the service, so the UI can show which one is live.
+   */
+  activePort: number | null;
 }
 
 export interface GitInfo {
@@ -93,7 +98,43 @@ export interface Snapshot {
   lastPullAt: number | null;
   configPath: string;
   logDir: string;
+  /**
+   * Service id → ids of other configured services claiming the same port. Lets the UI
+   * warn about a clash before you try to start, not only after it is refused.
+   */
+  sharedPorts: Record<string, string[]>;
 }
+
+/** Whatever is currently holding a port we wanted. */
+export interface PortHolder {
+  pid: number | null;
+  process: string | null;
+  /** Set when the holder is a service this console started. */
+  serviceId: string | null;
+  serviceName: string | null;
+  /**
+   * True when the port looks container-published. Docker publishes ports from a
+   * namespace this process cannot inspect without elevation, so there is no pid to
+   * signal — the container has to be stopped instead.
+   */
+  likelyContainer: boolean;
+}
+
+/** Everything the UI needs to offer a way out of a port clash. */
+export interface PortConflict {
+  serviceId: string;
+  port: number;
+  holder: PortHolder;
+  /** A nearby free port, offered as a one-click alternative. */
+  suggestedPort: number | null;
+  /** How a port override would be applied, or null when the command cannot take one. */
+  overrideMechanism: string | null;
+  /** Set when the override mechanism is not guaranteed to reach the process. */
+  overrideCaveat: string | null;
+}
+
+/** How the user chose to resolve a clash. */
+export type ConflictResolution = "stop-holder" | "kill-holder" | "use-port";
 
 /** Result shape returned by every action endpoint. */
 export interface ActionResult {
@@ -102,6 +143,8 @@ export interface ActionResult {
   /** True when a pull touched a lockfile or build file and deps should be installed. */
   needsInstall?: boolean;
   conflicts?: boolean;
+  /** Present when a start was refused because the port was taken. */
+  conflict?: PortConflict;
 }
 
 export const CONSOLE_LOG_SERVICE = "console";
