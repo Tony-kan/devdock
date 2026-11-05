@@ -59,6 +59,11 @@ reachable from the network. Change the port with `-p` in the `dev` script.
 **Process control** — start, stop, restart, and start/stop all. Stop sends `SIGTERM`
 to the whole process group and escalates to `SIGKILL` after a grace period. "Start
 all" honours `dependsOn` ordering and waits for each dependency to become usable.
+Starting a single service does the same for its own `dependsOn` chain: anything not
+already running is started first, in order, and the chain runs in the background with
+progress in the log pane. "Usable" means a passing health check for a service with a
+`healthPath`, and every container reporting healthy for a Docker Compose entry — a
+published port proves nothing, because Docker opens it before Postgres listens.
 Tracks real PID, status (`stopped` / `starting` / `running` / `crashed`), uptime, exit
 code and restart count.
 
@@ -87,7 +92,10 @@ reference each other by port and a silent change breaks them invisibly. Where a 
 shared by several configured services, the service header warns before you even try.
 
 **Git, per service and workspace-wide** — current branch, ahead/behind and dirty
-count; `git pull --rebase` with the resulting diffstat streamed into the log pane.
+count; `git pull --rebase --autostash` with the resulting diffstat streamed into the log
+pane. Uncommitted edits are stashed for the pull and re-applied after it; if they no
+longer apply cleanly they stay in `git stash list` and the pull says so. A branch with
+no upstream is reported as such, and a dropped SSH connection is retried once.
 Conflicts are surfaced and **never** auto-resolved. "Install deps" is a separate
 action, and the console prompts for it when a pull touched a lockfile or build file.
 
@@ -180,6 +188,56 @@ Each entry looks like this:
 repository the service belongs to — set it when a service lives in a subdirectory of a
 larger repo. `url` overrides the `http://localhost:<port>` address used by **Open**.
 
+### Shared environment
+
+A top-level `env` object applies to every service, beneath each service's own `env`:
+
+```json
+{
+  "root": "/home/me/IdeaProjects",
+  "env": {
+    "USER_SERVICE_URL": "http://localhost:8080",
+    "VITE_USER_SERVICE_URL": "http://localhost:8080",
+    "CORS_ALLOWED_ORIGINS": "http://localhost:3000,http://localhost:3001",
+    "ACTION_TO_STOCK_TOKEN": "local-only-value"
+  },
+  "services": []
+}
+```
+
+This is where things that must agree across services belong: the URLs services call
+each other on, the origins every backend admits, and tokens shared by a caller and the
+service it calls. One copy cannot drift. Spring maps `USER_SERVICE_URL` onto
+`user-service.url` by relaxed binding, and an OS variable outranks the profile's
+properties file, so these override hard-coded values without touching the repos. Vite
+likewise lets `VITE_*` variables already in the environment win over `.env` files.
+
+### Running several Docker Compose stacks at once
+
+Compose names a project after the directory of its first file, so every repo's
+`docker/dev/docker-compose.yaml` lands in one project called `dev`, and stacks
+publishing the same host ports cannot run side by side. Give each infra entry its own
+project and an override file that remaps the ports:
+
+```
+docker compose -p action-service-dev -f docker/dev/docker-compose.yaml -f /abs/path/action-service.yaml up
+```
+
+```yaml
+services:
+  actionservice-postgres:
+    ports: !override
+      - "127.0.0.1:5484:5432"
+```
+
+`!override` replaces the list; without it compose appends to the original ports. The
+service then needs the matching URL, e.g. `SPRING_R2DBC_URL`. Override files are
+machine-local; `/local/` is gitignored for them.
+
+Spring Boot's own compose support must be off (`SPRING_DOCKER_COMPOSE_ENABLED=false`)
+when the console runs the infra, or the application starts a second copy of the stack
+under the default project name. A re-scan sets both for newly discovered entries.
+
 ## Adding a service
 
 Press **Add** in the service list, fill in name, command and port, and press Add. That
@@ -230,7 +288,9 @@ the selected service.
 provision anything. If a project requires a runtime or JDK version that is not
 installed — for example a Gradle toolchain requesting a Java version absent from the
 machine — the start fails and the error appears in the log pane. Fixing that means
-installing the toolchain.
+installing the toolchain. Likewise private registries: a Gradle build that reads
+`GRADLE_USERNAME`/`GRADLE_PASSWORD` gets a warning at start when neither the console's
+environment nor `services.json` provides them, but the console cannot supply them.
 
 **Declared ports can collide.** Generated ports come from what each project declares.
 Projects that declare nothing fall back to their framework default, so several services

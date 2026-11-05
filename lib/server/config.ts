@@ -15,6 +15,15 @@ interface LoadResult {
 
 let cache: { mtimeMs: number; config: ConsoleConfig } | null = null;
 
+function normalizeEnv(raw: unknown): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (!raw || typeof raw !== "object") return env;
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (key.trim()) env[key.trim()] = String(value ?? "");
+  }
+  return env;
+}
+
 function normalize(raw: unknown, index: number): ServiceConfig | null {
   if (!raw || typeof raw !== "object") return null;
   const entry = raw as Record<string, unknown>;
@@ -30,12 +39,7 @@ function normalize(raw: unknown, index: number): ServiceConfig | null {
   const kind = KINDS.includes(entry.kind as ServiceKind) ? (entry.kind as ServiceKind) : "Other";
   const cwd = typeof entry.cwd === "string" && entry.cwd.trim() ? entry.cwd.trim() : ".";
   const portValue = Number(entry.port);
-  const env: Record<string, string> = {};
-  if (entry.env && typeof entry.env === "object") {
-    for (const [key, value] of Object.entries(entry.env as Record<string, unknown>)) {
-      if (typeof key === "string" && key.trim()) env[key.trim()] = String(value ?? "");
-    }
-  }
+  const env = normalizeEnv(entry.env);
 
   return {
     id,
@@ -65,7 +69,13 @@ function parse(body: string): ConsoleConfig {
     seen.add(service.id);
     services.push(service);
   });
-  return { root, services };
+  const env = normalizeEnv(raw.env);
+  return Object.keys(env).length > 0 ? { root, env, services } : { root, services };
+}
+
+/** The environment a service runs with: the shared block, then its own entries on top. */
+export function serviceEnv(config: ConsoleConfig, service: ServiceConfig): Record<string, string> {
+  return { ...(config.env ?? {}), ...(service.env ?? {}) };
 }
 
 /**

@@ -1,10 +1,11 @@
 import fs from "node:fs";
+import path from "node:path";
 import { getConfig, getCore, invalidateGit, markPulled, repoForService, repoPaths, writeConfig } from "./core";
 import { resolveIn } from "./paths";
 import { run } from "./exec";
 import { gitPull, installCommandFor } from "./git";
 import { planPortOverride } from "./portOverride";
-import { startOrder } from "./config";
+import { serviceEnv, startOrder } from "./config";
 import type { ActionResult, ConflictResolution, ServiceConfig } from "../types";
 
 /** Pull the repository a single service lives in. */
@@ -39,6 +40,7 @@ export async function pullAll(): Promise<ActionResult> {
   core.logs.console("info", `Pulling ${repos.length} repositories.`);
 
   let pulled = 0;
+  let skipped = 0;
   let failed = 0;
   let conflicted = 0;
   const needsInstall: string[] = [];
@@ -53,6 +55,7 @@ export async function pullAll(): Promise<ActionResult> {
     const outcome = await gitPull(dir, rel, (level, text) => core.logs.console(level, text));
     invalidateGit(rel);
     if (outcome.conflicts) conflicted += 1;
+    else if (outcome.skipped) skipped += 1;
     else if (outcome.ok) pulled += 1;
     else failed += 1;
     if (outcome.needsInstall) needsInstall.push(rel);
@@ -61,6 +64,7 @@ export async function pullAll(): Promise<ActionResult> {
   markPulled();
 
   const parts = [`${pulled} pulled`];
+  if (skipped) parts.push(`${skipped} not repositories`);
   if (conflicted) parts.push(`${conflicted} with conflicts`);
   if (failed) parts.push(`${failed} failed`);
   const message = `Pull latest: ${parts.join(", ")}.`;
@@ -71,6 +75,18 @@ export async function pullAll(): Promise<ActionResult> {
   }
 
   return { ok: failed === 0 && conflicted === 0, message, needsInstall: needsInstall.length > 0, conflicts: conflicted > 0 };
+}
+
+/**
+ * Where to run the install. A Node service run from inside an npm workspace
+ * (`packages/website`, say) installs from the repository root: the lockfile and the
+ * `node_modules` every package resolves from both live there.
+ */
+function installDirFor(service: ServiceConfig, root: string): string {
+  const cwd = resolveIn(root, service.cwd);
+  if (service.kind !== "Node") return cwd;
+  const repo = resolveIn(root, repoForService(service));
+  return repo !== cwd && fs.existsSync(path.join(repo, "package.json")) ? repo : cwd;
 }
 
 /** Run the ecosystem's dependency install for one service. */
@@ -84,13 +100,13 @@ export async function installDeps(service: ServiceConfig): Promise<ActionResult>
     return { ok: false, message };
   }
 
-  const dir = resolveIn(config.root, service.cwd);
+  const dir = installDirFor(service, config.root);
   core.supervisor.setBusy(service.id, "installing");
-  core.logs.append(service.id, "info", `$ ${command}`);
+  core.logs.append(service.id, "info", `$ ${command}   (in ${dir})`);
   try {
     const result = await run(command, null, {
       cwd: dir,
-      env: { NO_COLOR: "1", FORCE_COLOR: "0", ...service.env },
+      env: { NO_COLOR: "1", FORCE_COLOR: "0", ...serviceEnv(config, service) },
       sink: (level, text) => core.logs.append(service.id, level, text),
       timeoutMs: 15 * 60_000,
     });
@@ -133,7 +149,25 @@ export interface StartRequest {
 export async function startService(service: ServiceConfig, request: StartRequest = {}): Promise<ActionResult> {
   const core = getCore();
 
-  if (!request.resolve) return core.supervisor.start(service);
+  if (!request.resolve) {
+    const pending = core.supervisor.pendingDependencies(service);
+    if (pending.length === 0) return core.supervisor.start(service);
+
+    // Bringing up a database and a backend first can take minutes, far longer than a
+    // request should hang. The chain runs in the background and reports in the log
+    // pane; a port clash on the service itself is logged there too, with the same
+    // ways out the conflict panel would have offered.
+    const names = pending.map((s) => s.name).join(", ");
+    core.logs.append(service.id, "info", `Starting ${pending.length} dependenc${pending.length === 1 ? "y" : "ies"} first: ${names}.`);
+    core.supervisor.setBusy(service.id, "starting dependencies");
+    void core.supervisor
+      .startWithDependencies(service)
+      .catch((error: unknown) => {
+        core.logs.append(service.id, "error", `Start failed: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => core.supervisor.setBusy(service.id, null));
+    return { ok: true, message: `Starting ${service.name} after ${names}…` };
+  }
 
   if (request.resolve === "use-port") {
     const port = Number(request.port);

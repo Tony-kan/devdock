@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { capture, run, type LineSink } from "./exec";
 import type { GitInfo, ServiceConfig } from "../types";
 
@@ -72,17 +74,53 @@ export interface PullOutcome {
   conflicts: boolean;
   needsInstall: boolean;
   message: string;
+  /** Set when there was nothing to pull because the directory is not a repository root. */
+  skipped?: boolean;
 }
+
+/** Failures where the server dropped the connection rather than refusing the pull. */
+const TRANSIENT_REMOTE_ERRORS = ["Could not read from remote repository", "Connection reset", "Connection closed by"];
 
 /**
  * `git pull --rebase` with the full output streamed to the log pane.
+ *
+ * `--autostash` lets a repo with uncommitted edits — a local port tweak, say — pull at
+ * all; plain `--rebase` refuses outright. The edits are stashed, the rebase runs, and
+ * they are re-applied. If re-applying conflicts, git keeps them in `git stash list`
+ * rather than losing them, and that is reported below.
  *
  * Conflicts are reported and left exactly as git left them — nothing here aborts,
  * resets or resolves, because that would silently discard the user's work.
  */
 export async function gitPull(dir: string, rel: string, sink: LineSink): Promise<PullOutcome> {
-  sink("info", `$ git -C ${rel} pull --rebase --stat`);
-  const result = await run("git", ["pull", "--rebase", "--stat"], { cwd: dir, sink, timeoutMs: 120_000 });
+  // Only pull a directory that is itself a repository root. Infra kept inside another
+  // repo's ignored folder — or anything not under git at all — would otherwise pull
+  // whatever repository happens to contain it.
+  const top = await capture("git", ["rev-parse", "--show-toplevel"], dir, 5000);
+  if (top.code !== 0 || path.resolve(top.stdout.trim()) !== fs.realpathSync(dir)) {
+    sink("info", `${rel}: not a git repository root — nothing to pull.`);
+    return { ok: true, conflicts: false, needsInstall: false, skipped: true, message: `${rel}: not a repository` };
+  }
+
+  const upstream = await capture("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], dir, 5000);
+  if (upstream.code !== 0) {
+    const branch = (await capture("git", ["rev-parse", "--abbrev-ref", "HEAD"], dir, 5000)).stdout.trim() || "HEAD";
+    sink("warn", `${rel}: branch "${branch}" has no upstream, so there is nothing to pull from.`);
+    sink("warn", `${rel}: push it with \`git push -u origin ${branch}\`, or switch to a tracked branch.`);
+    return { ok: false, conflicts: false, needsInstall: false, message: `${rel}: no upstream for "${branch}"` };
+  }
+
+  const args = ["pull", "--rebase", "--autostash", "--stat"];
+  sink("info", `$ git -C ${rel} ${args.join(" ")}`);
+  let result = await run("git", args, { cwd: dir, sink, timeoutMs: 120_000 });
+
+  // An SSH server rate-limiting connections drops some of a burst of pulls. One retry
+  // after a pause clears it; a real auth or network failure fails the same way twice.
+  if (result.code !== 0 && TRANSIENT_REMOTE_ERRORS.some((m) => result.stderr.includes(m))) {
+    sink("warn", `${rel}: the remote dropped the connection — retrying once.`);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    result = await run("git", args, { cwd: dir, sink, timeoutMs: 120_000 });
+  }
 
   if (result.spawnError) {
     sink("error", `git could not run: ${result.spawnError}`);
@@ -91,6 +129,12 @@ export async function gitPull(dir: string, rel: string, sink: LineSink): Promise
 
   const combined = `${result.stdout}\n${result.stderr}`;
   const conflicts = CONFLICT_MARKERS.some((marker) => combined.includes(marker));
+
+  if (combined.includes("Applying autostash resulted in conflicts")) {
+    sink("error", `${rel}: pulled, but your local edits conflicted with what came in.`);
+    sink("warn", `${rel}: they are safe in \`git -C ${rel} stash list\` — re-apply with \`git stash pop\` and resolve.`);
+    return { ok: false, conflicts: true, needsInstall: false, message: `${rel}: local edits conflicted — kept in the stash` };
+  }
 
   if (conflicts) {
     sink("error", `${rel}: rebase stopped on conflicts — resolve them manually, then re-run the pull.`);

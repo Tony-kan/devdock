@@ -192,7 +192,10 @@ function classify(candidate: Candidate): ServiceConfig[] {
       name: `${name} infra`,
       kind: "Docker",
       cwd: rel,
-      command: `docker compose -f ${composePath} up`,
+      // Without `-p`, compose names the project after the file's directory, so every
+      // repo's docker/dev/docker-compose.yaml would share one project called "dev" and
+      // bringing one stack up would treat the others' containers as its orphans.
+      command: `docker compose -p ${slug(name)}-dev -f ${composePath} up`,
       port: null,
       env: {},
       healthPath: null,
@@ -221,7 +224,11 @@ function classify(candidate: Candidate): ServiceConfig[] {
         // app is a child of this gradlew, inside the group we signal.
         command: "./gradlew bootRun --console=plain --no-daemon",
         port,
-        env: { SPRING_PROFILES_ACTIVE: "dev" },
+        // When the console runs the infra, Spring Boot's own compose support must not:
+        // it would bring up a second copy of the stack under the default project name.
+        env: infraId
+          ? { SPRING_PROFILES_ACTIVE: "dev", SPRING_DOCKER_COMPOSE_ENABLED: "false" }
+          : { SPRING_PROFILES_ACTIVE: "dev" },
         healthPath: "/actuator/health",
         dependsOn: infraId ? [infraId] : [],
         autoStart: false,

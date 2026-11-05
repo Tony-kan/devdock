@@ -36,6 +36,13 @@ export interface ServiceConfig {
 export interface ConsoleConfig {
   /** Absolute path to the workspace this console controls. */
   root: string;
+  /**
+   * Environment applied to every service, beneath each service's own `env`. Services
+   * in a workspace address each other by URL and share pairwise tokens, so those
+   * belong in one place: two copies of a token drift, and a mismatched pair fails as
+   * a 401 between services rather than as anything that names the cause.
+   */
+  env?: Record<string, string>;
   services: ServiceConfig[];
 }
 

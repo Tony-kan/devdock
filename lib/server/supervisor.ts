@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { LOG_DIR, STATE_PATH, resolveIn } from "./paths";
 import {
@@ -14,7 +15,8 @@ import {
   whoHoldsPort,
 } from "./ports";
 import { planPortOverride } from "./portOverride";
-import { childEnvironment } from "./exec";
+import { capture, childEnvironment } from "./exec";
+import { serviceEnv, startOrder } from "./config";
 import type { LogStore } from "./logs";
 import type {
   ActionResult,
@@ -39,6 +41,13 @@ const HEALTH_INTERVAL_MS = 10_000;
 const HEALTH_TIMEOUT_MS = 2500;
 /** How long "start all" waits for one dependency before moving on. */
 const DEPENDENCY_TIMEOUT_MS = 90_000;
+/**
+ * A Spring dependency compiles before it serves, and `bootRun` on a cold Gradle cache
+ * can take minutes. Giving up at 90s would start its dependants against nothing.
+ */
+const SPRING_DEPENDENCY_TIMEOUT_MS = 5 * 60_000;
+/** Infra with a slow healthcheck (Keycloak takes ~40s) still lands well inside this. */
+const DOCKER_DEPENDENCY_TIMEOUT_MS = 3 * 60_000;
 /** Extra settle time for a dependency with no health endpoint to prove itself with. */
 const BLIND_DEPENDENCY_GRACE_MS = 5000;
 
@@ -117,6 +126,21 @@ function describeConflictHolder(holder: PortHolder): string {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The compose project a `docker compose … up` command runs as: `-p` when given,
+ * otherwise what compose derives from the first file's directory. That fallback is why
+ * every `docker/dev/docker-compose.yaml` in a workspace lands in one project called
+ * "dev" — and why each infra entry should pass `-p`.
+ */
+export function composeProjectOf(command: string, cwd: string): string | null {
+  if (!/\bdocker\s+compose\b|\bdocker-compose\b/.test(command)) return null;
+  const explicit = command.match(/(?:\s-p|\s--project-name)[\s=]+(\S+)/);
+  if (explicit) return explicit[1];
+  const file = command.match(/\s-f[\s=]+(\S+)/)?.[1];
+  const dir = file ? path.dirname(path.resolve(cwd, file)) : cwd;
+  return path.basename(dir).toLowerCase().replace(/[^a-z0-9_-]/g, "");
+}
 
 export class Supervisor {
   private processes = new Map<string, Managed>();
@@ -387,8 +411,9 @@ export class Supervisor {
       // Keep ANSI colour sequences out of the log pane.
       NO_COLOR: "1",
       FORCE_COLOR: "0",
-      ...service.env,
+      ...serviceEnv(config, service),
     };
+    this.warnAboutMissingCredentials(service, cwd, env);
 
     if (options.portOverride) {
       const plan = planPortOverride(service, options.portOverride, cwd);
@@ -781,10 +806,84 @@ export class Supervisor {
     return { ok: started > 0, message };
   }
 
+  /**
+   * Start one service after everything it depends on, transitively.
+   *
+   * Dependencies that are already up are left alone; the rest are started in order and
+   * each is waited on until usable, so a service is never launched against a database
+   * that is still initialising. The service itself is started even if a dependency
+   * failed — its own log is the clearest account of what it is missing.
+   */
+  async startWithDependencies(service: ServiceConfig): Promise<ActionResult> {
+    const chain = startOrder(this.getConfig().services, [service.id]).filter((s) => s.id !== service.id);
+    const token = this.bulkToken;
+
+    for (const dependency of chain) {
+      if (token !== this.bulkToken || this.shuttingDown) {
+        const message = `Start of ${service.name} cancelled while its dependencies were starting.`;
+        this.log(service.id, "warn", message);
+        return { ok: false, message };
+      }
+      const managed = this.managed(dependency);
+      if (!this.isAlive(managed)) {
+        this.log(service.id, "info", `Starting dependency ${dependency.name} first.`);
+        const result = await this.start(dependency);
+        if (!result.ok) {
+          this.log(service.id, "warn", `Dependency ${dependency.name} did not start: ${result.message}`);
+          continue;
+        }
+      }
+      await this.waitUntilUsable(dependency);
+    }
+
+    return this.start(service);
+  }
+
+  /** Dependencies of `service` that are not running yet, in start order. */
+  pendingDependencies(service: ServiceConfig): ServiceConfig[] {
+    return startOrder(this.getConfig().services, [service.id]).filter(
+      (s) => s.id !== service.id && !this.isAlive(this.managed(s)),
+    );
+  }
+
+  /**
+   * Gradle builds here resolve shared libraries from the Gitea package registry, which
+   * reads its credentials from the environment. Without them the build fails deep in
+   * dependency resolution with a 401 that never says which variable was missing.
+   */
+  private warnAboutMissingCredentials(service: ServiceConfig, cwd: string, env: Record<string, string>): void {
+    if (service.kind !== "Spring" && service.kind !== "Gradle") return;
+    let build = "";
+    for (const name of ["build.gradle", "build.gradle.kts"]) {
+      try {
+        build = fs.readFileSync(path.join(cwd, name), "utf8");
+        break;
+      } catch {
+        // Try the next build file name.
+      }
+    }
+    if (!build.includes("GRADLE_USERNAME")) return;
+    const missing = ["GRADLE_USERNAME", "GRADLE_PASSWORD"].filter((key) => !(env[key] ?? process.env[key]));
+    if (missing.length === 0) return;
+    this.log(
+      service.id,
+      "warn",
+      `${missing.join(" and ")} not set — the Gitea package registry will refuse Gradle unless the artifacts are already cached. ` +
+        `Export them in the shell that starts devdock, or add them to the shared "env" block in services.json.`,
+    );
+  }
+
   /** Wait for a dependency to look usable before starting whatever needs it. */
   private async waitUntilUsable(service: ServiceConfig): Promise<void> {
     const managed = this.managed(service);
-    const deadline = Date.now() + DEPENDENCY_TIMEOUT_MS;
+
+    if (service.kind === "Docker") {
+      await this.waitForContainers(service, managed);
+      return;
+    }
+
+    const timeoutMs = service.kind === "Spring" ? SPRING_DEPENDENCY_TIMEOUT_MS : DEPENDENCY_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
 
     if (!service.healthPath || !service.port) {
       this.log(service.id, "info", `Waiting ${BLIND_DEPENDENCY_GRACE_MS}ms for ${service.name} — it has no health endpoint to check.`);
@@ -804,7 +903,48 @@ export class Supervisor {
       }
       await sleep(1500);
     }
-    this.log(service.id, "warn", `${service.name} did not pass its health check within ${DEPENDENCY_TIMEOUT_MS / 1000}s — continuing anyway.`);
+    this.log(service.id, "warn", `${service.name} did not pass its health check within ${timeoutMs / 1000}s — continuing anyway.`);
+  }
+
+  /**
+   * A compose stack is usable once every container it started reports healthy (or is
+   * running and declares no healthcheck). Docker publishes a container's port before
+   * the process inside listens, so an open port proves nothing about Postgres.
+   */
+  private async waitForContainers(service: ServiceConfig, managed: Managed): Promise<void> {
+    const project = composeProjectOf(service.command, resolveIn(this.getConfig().root, service.cwd));
+    if (!project) {
+      this.log(service.id, "info", `Waiting ${BLIND_DEPENDENCY_GRACE_MS}ms for ${service.name} — its compose project could not be determined.`);
+      await sleep(BLIND_DEPENDENCY_GRACE_MS);
+      return;
+    }
+
+    this.log(service.id, "info", `Waiting for ${service.name} containers (project ${project}) to report healthy…`);
+    const deadline = Date.now() + DOCKER_DEPENDENCY_TIMEOUT_MS;
+    let readyPolls = 0;
+    while (Date.now() < deadline) {
+      if (!this.isAlive(managed)) {
+        this.log(service.id, "error", `${service.name} exited while starting — dependants will start anyway.`);
+        return;
+      }
+      const result = await capture(
+        "docker",
+        ["ps", "--filter", `label=com.docker.compose.project=${project}`, "--format", "{{.Status}}"],
+        process.cwd(),
+        8000,
+      );
+      const statuses = result.code === 0 ? result.stdout.split("\n").filter((line) => line.trim() !== "") : [];
+      const settled = statuses.length > 0 && statuses.every((s) => !/health: starting|unhealthy/i.test(s));
+      // Two settled polls in a row: compose creates containers one by one, so a single
+      // all-healthy reading can come before the last container exists.
+      readyPolls = settled ? readyPolls + 1 : 0;
+      if (readyPolls >= 2) {
+        this.log(service.id, "info", `${service.name} is healthy (${statuses.length} container(s)).`);
+        return;
+      }
+      await sleep(2000);
+    }
+    this.log(service.id, "warn", `${service.name} containers were not healthy within ${DOCKER_DEPENDENCY_TIMEOUT_MS / 1000}s — continuing anyway.`);
   }
 
   async stopAll(ordered: ServiceConfig[]): Promise<ActionResult> {
