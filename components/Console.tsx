@@ -46,6 +46,8 @@ export function Console({ initial }: { initial: Snapshot }) {
   const [editing, setEditing] = useState(false);
   const [conflict, setConflict] = useState<PortConflict | null>(null);
   const searchRef = useRef<HTMLInputElement | null>(null);
+  const [serviceQuery, setServiceQuery] = useState("");
+  const serviceSearchRef = useRef<HTMLInputElement | null>(null);
 
   const service = useMemo(
     () => (selected === ALL_SERVICES ? null : snapshot.services.find((s) => s.id === selected) ?? null),
@@ -78,6 +80,37 @@ export function Console({ initial }: { initial: Snapshot }) {
       canMoveDown: position < ranked.length - 1 && ranked[position + 1].rank === entry.rank,
     }));
   }, [snapshot.runtime, snapshot.services]);
+
+  /**
+   * The rows the service search leaves on screen. Every word must match somewhere in the
+   * service's name, id, kind, port, path or current status, so "supplier ui" and
+   * "spring running" both narrow as you would expect.
+   *
+   * While a search is active the reorder arrows are off: neighbours in a filtered list are
+   * not neighbours in services.json, so a swap would move a service past hidden ones.
+   */
+  const shownRows = useMemo(() => {
+    const words = serviceQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return rows;
+    return rows
+      .filter(({ service: entry }) => {
+        const runtime = snapshot.runtime[entry.id];
+        const haystack = [
+          entry.name,
+          entry.id,
+          entry.kind,
+          entry.port ? String(entry.port) : "",
+          entry.cwd,
+          entry.repo ?? "",
+          runtime?.status ?? "stopped",
+          runtime?.busy ?? "",
+        ]
+          .join(" ")
+          .toLowerCase();
+        return words.every((word) => haystack.includes(word));
+      })
+      .map((row) => ({ ...row, canMoveUp: false, canMoveDown: false }));
+  }, [rows, serviceQuery, snapshot.runtime]);
 
   // ------------------------------------------------------------------ streaming
 
@@ -347,8 +380,8 @@ export function Console({ initial }: { initial: Snapshot }) {
       }
       if (typing || event.metaKey || event.ctrlKey || event.altKey) return;
 
-      // j/k walk the list as displayed, not as configured.
-      const ids = [ALL_SERVICES, ...rows.map((row) => row.service.id)];
+      // j/k walk the list as displayed, not as configured — including a search's narrowing.
+      const ids = [ALL_SERVICES, ...shownRows.map((row) => row.service.id)];
       const index = ids.indexOf(activeId);
 
       switch (event.key) {
@@ -384,6 +417,11 @@ export function Console({ initial }: { initial: Snapshot }) {
           event.preventDefault();
           searchRef.current?.focus();
           break;
+        case "g":
+          event.preventDefault();
+          serviceSearchRef.current?.focus();
+          serviceSearchRef.current?.select();
+          break;
         case "j":
         case "ArrowDown":
           event.preventDefault();
@@ -401,7 +439,7 @@ export function Console({ initial }: { initial: Snapshot }) {
 
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [activeId, openService, rows, serviceAction]);
+  }, [activeId, openService, shownRows, serviceAction]);
 
   // Informational notices fade; errors and warnings stay until dismissed.
   useEffect(() => {
@@ -427,7 +465,11 @@ export function Console({ initial }: { initial: Snapshot }) {
       <div className="flex min-h-0 flex-1">
         <ServiceList
           snapshot={snapshot}
-          rows={rows}
+          rows={shownRows}
+          totalCount={rows.length}
+          query={serviceQuery}
+          onQueryChange={setServiceQuery}
+          searchRef={serviceSearchRef}
           selected={activeId}
           onSelect={(id) => {
             setSelected(id);

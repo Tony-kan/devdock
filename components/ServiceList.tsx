@@ -14,8 +14,13 @@ export interface ServiceRow {
 
 interface Props {
   snapshot: Snapshot;
-  /** Pre-ordered by the parent: running first, then crashed, then stopped. */
+  /** Pre-ordered by the parent: running first, then crashed, then stopped. Already filtered by `query`. */
   rows: ServiceRow[];
+  /** How many services there are before the search narrows them. */
+  totalCount: number;
+  query: string;
+  onQueryChange: (query: string) => void;
+  searchRef: React.RefObject<HTMLInputElement | null>;
   selected: string;
   onSelect: (id: string) => void;
   onAdd: (draft: { name: string; command: string; port: string; cwd: string; kind: ServiceKind }) => Promise<void>;
@@ -197,9 +202,23 @@ function Row({
   );
 }
 
-export function ServiceList({ snapshot, rows, selected, onSelect, onAdd, onReorder, onRescan, busy }: Props) {
+export function ServiceList({
+  snapshot,
+  rows,
+  totalCount,
+  query,
+  onQueryChange,
+  searchRef,
+  selected,
+  onSelect,
+  onAdd,
+  onReorder,
+  onRescan,
+  busy,
+}: Props) {
   const [adding, setAdding] = useState(false);
   const runningCount = snapshot.counts.running;
+  const searching = query.trim() !== "";
 
   return (
     <aside className="flex w-66 shrink-0 flex-col border-r border-line bg-panel xl:w-80">
@@ -208,9 +227,15 @@ export function ServiceList({ snapshot, rows, selected, onSelect, onAdd, onReord
         {/* The running count lives in the stat strip; repeating it here crowds the row. */}
         <span
           className="font-mono text-[11px] text-ink-faint"
-          title={runningCount > 0 ? `${runningCount} running, listed first` : undefined}
+          title={
+            searching
+              ? `${rows.length} of ${totalCount} match the search`
+              : runningCount > 0
+                ? `${runningCount} running, listed first`
+                : undefined
+          }
         >
-          {rows.length}
+          {searching ? `${rows.length}/${totalCount}` : totalCount}
         </span>
         <div className="ml-auto flex items-center gap-1">
           <Button tone="ghost" onClick={onRescan} disabled={busy !== null} className="px-2 py-1 text-xs">
@@ -231,6 +256,41 @@ export function ServiceList({ snapshot, rows, selected, onSelect, onAdd, onReord
           onCancel={() => setAdding(false)}
         />
       ) : null}
+
+      <div className="relative border-b border-line px-3 py-2">
+        <input
+          ref={searchRef}
+          type="text"
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && rows.length > 0) {
+              e.preventDefault();
+              onSelect(rows[0].service.id);
+            } else if (e.key === "Escape" && query) {
+              // The console's own Esc handler blurs the field after this clears it.
+              onQueryChange("");
+            }
+          }}
+          placeholder="Search services   g"
+          aria-label="Search services by name, kind, port, path or status"
+          title="Matches name, id, kind, port, path and status. Enter selects the first match, Esc clears."
+          className={`${inputClass} pr-7`}
+        />
+        {searching ? (
+          <button
+            type="button"
+            onClick={() => {
+              onQueryChange("");
+              searchRef.current?.focus();
+            }}
+            aria-label="Clear search"
+            className="absolute top-1/2 right-4.5 -translate-y-1/2 rounded px-1 text-sm leading-none text-ink-faint hover:text-ink"
+          >
+            ×
+          </button>
+        ) : null}
+      </div>
 
       <div className="scroll-slim min-h-0 flex-1 overflow-y-auto">
         <ul>
@@ -262,7 +322,16 @@ export function ServiceList({ snapshot, rows, selected, onSelect, onAdd, onReord
             />
           ))}
 
-          {rows.length === 0 ? (
+          {rows.length === 0 && searching ? (
+            <li className="px-3 py-6 text-sm text-ink-faint">
+              No service matches <span className="font-mono text-ink-soft">“{query.trim()}”</span>.{" "}
+              <button type="button" onClick={() => onQueryChange("")} className="font-medium text-accent hover:underline">
+                Clear search
+              </button>
+            </li>
+          ) : null}
+
+          {totalCount === 0 ? (
             <li className="px-3 py-6 text-sm text-ink-faint">
               Nothing configured yet. Use <span className="font-medium text-ink-soft">Add</span> or{" "}
               <span className="font-medium text-ink-soft">Re-scan</span>.

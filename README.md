@@ -125,8 +125,15 @@ directory, port, health path, env vars, dependencies, autoStart and the Open URL
 reorder and remove services. Nothing requires restarting the console.
 
 **Keyboard shortcuts** — `s` start · `r` restart · `x` stop · `p` pull ·
-`i` install deps · `o` open · `f` follow/pause · `/` focus search · `j`/`k` move the
-selection · `Esc` close. Ignored while a text field has focus.
+`i` install deps · `o` open · `f` follow/pause · `/` focus log search · `g` focus
+service search · `j`/`k` move the selection · `Esc` close. Ignored while a text field has
+focus.
+
+**Service search** — the box above the service list narrows it as you type. Every word
+must match the service's name, id, kind, port, path or status, so `supplier ui`,
+`8083` and `spring running` all work. `Enter` selects the first match, `Esc` clears.
+`j`/`k` walk only the matches, and the ▲▼ reorder arrows are off while a search is
+active, since neighbours in a filtered list are not neighbours in `services.json`.
 
 ## Choosing the workspace
 
